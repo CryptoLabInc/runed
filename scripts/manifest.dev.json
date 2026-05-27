@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "platforms": {
+    "darwin-arm64": {
+      "llama_server": {
+        "url": "https://example.com/runed-releases/runed-darwin-arm64.tar.gz",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "size": 0,
+        "extract": "tar.gz",
+        "exec": "llama-server"
+      }
+    }
+  },
+  "models": {
+    "qwen3-embedding-0.6b.q6_K": {
+      "url": "https://example.com/models/qwen3-embedding-0.6b-q6_K.gguf",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 0
+    }
+  },
+  "default_model": "qwen3-embedding-0.6b.q6_K"
+}
