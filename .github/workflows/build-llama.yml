@@ -1,22 +1,22 @@
 name: build-llama
 
-# Stub for the vendor prebuild workflow.
+# Vendor prebuild: builds llama-server for every supported platform and
+# publishes the binaries plus the pinned embedding model to GHCR as OCI
+# artifacts. build.yml / release.yaml pull from GHCR instead of rebuilding
+# llama.cpp on every run.
 #
-# Intent: this workflow will, when triggered manually, build llama-server
-# from the ref pinned in .llama-cpp-version for every supported platform and
-# publish the binaries (plus the embedding model GGUF pinned in
-# .embedding-model.yaml) as OCI artifacts under
-# ghcr.io/CryptoLabInc/runed/* . The build.yml and release.yaml workflows
-# will then pull from GHCR instead of building llama.cpp on every run.
+# Triggers:
+#   - workflow_dispatch: manual rebuild (with optional overrides).
+#   - pull_request that touches the pin files: validate-only build, no push
+#     to GHCR. Surfaces breakage in the same PR that bumps the pin.
+#   - push to main that touches the pin files: build AND push to GHCR.
 #
-# Rationale: llama.cpp + GGUF model rarely change. Building them on every
-# PR (~5min linux, ~20min macOS first time) is wasted work, and the
-# actions/cache 7-day eviction means a single slow week recreates the cost.
-# A workflow_dispatch-only prerequisite that pushes to GHCR makes the
-# artifacts effectively permanent.
+# Artifacts:
+#   ghcr.io/<repo-lowercase>/llama-server:<llama-cpp-ref>-<os>-<arch>
 #
-# This stub exists so the workflow file is present on main and can be
-# referenced by future PRs. Implementation lands in a follow-up PR.
+# The embedding model is NOT vendored here — it's a passthrough fetch from
+# HuggingFace, not a build artifact, so a GHCR mirror adds no value beyond
+# what actions/cache already provides via .embedding-model.yaml's sha256.
 
 on:
   workflow_dispatch:
@@ -25,22 +25,144 @@ on:
         description: 'llama.cpp ref to build (default: read from .llama-cpp-version)'
         required: false
         type: string
-      embedding_model_sha:
-        description: 'Embedding model sha256 (default: read from .embedding-model.yaml)'
+      force_rebuild:
+        description: 'Rebuild + push to GHCR even if the tag already exists'
         required: false
-        type: string
+        default: false
+        type: boolean
+  pull_request:
+    paths:
+      - '.llama-cpp-version'
+      - 'ci/llama-cpp-cache.cmake'
+      - '.github/workflows/build-llama.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.llama-cpp-version'
+      - 'ci/llama-cpp-cache.cmake'
+      - '.github/workflows/build-llama.yml'
 
 permissions:
   contents: read
-  packages: write   # required to push OCI artifacts to ghcr.io
+  packages: write
+
+concurrency:
+  group: build-llama-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  stub:
-    runs-on: ubuntu-latest
+  # ─── llama-server: per-platform build + GHCR push ─────────────────────
+  llama-server:
+    name: llama-server (${{ matrix.os }}/${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-14,         os: darwin,  arch: arm64, kind: unix    }
+          - { runner: ubuntu-latest,    os: linux,   arch: amd64, kind: unix    }
+          - { runner: ubuntu-24.04-arm, os: linux,   arch: arm64, kind: unix    }
+          - { runner: windows-latest,   os: windows, arch: amd64, kind: windows }
+
     steps:
-      - name: Placeholder
+      - uses: actions/checkout@v4
+
+      - name: Resolve llama.cpp ref
+        id: ref
+        shell: bash
         run: |
-          echo "build-llama is a stub — implementation lands in a follow-up PR."
-          echo "Inputs received (for reference):"
-          echo "  llama_cpp_ref:       ${{ inputs.llama_cpp_ref }}"
-          echo "  embedding_model_sha: ${{ inputs.embedding_model_sha }}"
+          ref="${{ inputs.llama_cpp_ref }}"
+          if [ -z "${ref}" ]; then
+            ref=$(cat .llama-cpp-version)
+          fi
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute OCI tag
+        id: tag
+        shell: bash
+        run: |
+          ref_repo=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "tag=ghcr.io/${ref_repo}/llama-server:${{ steps.ref.outputs.ref }}-${{ matrix.os }}-${{ matrix.arch }}" >> "$GITHUB_OUTPUT"
+
+      # ─── Idempotency: check if GHCR already has this tag ──────────────
+      - name: Install oras
+        uses: oras-project/setup-oras@v1
+
+      - name: Login to GHCR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Check existing GHCR tag
+        id: check
+        shell: bash
+        run: |
+          if oras manifest fetch "${{ steps.tag.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Decide build plan
+        id: plan
+        shell: bash
+        run: |
+          # Skip iff: not a PR (PRs always rebuild to validate) AND tag already
+          # in GHCR AND user didn't force rebuild.
+          if [ "${{ github.event_name }}" != "pull_request" ] \
+             && [ "${{ steps.check.outputs.exists }}" = "true" ] \
+             && [ "${{ inputs.force_rebuild }}" != "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping — ${{ steps.tag.outputs.tag }} already in GHCR (force_rebuild=true to override)"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ─── Build llama-server (skipped if tag already in GHCR) ────────────
+      - name: Clone llama.cpp (windows)
+        if: steps.plan.outputs.skip != 'true' && matrix.kind == 'windows'
+        shell: bash
+        run: |
+          mkdir -p third_party
+          git clone --depth 1 --branch ${{ steps.ref.outputs.ref }} \
+            https://github.com/ggml-org/llama.cpp third_party/llama.cpp
+
+      - name: Build llama-server (unix)
+        if: steps.plan.outputs.skip != 'true' && matrix.kind == 'unix'
+        run: make llama-server
+
+      - name: Build llama-server.exe (windows)
+        if: steps.plan.outputs.skip != 'true' && matrix.kind == 'windows'
+        shell: pwsh
+        run: |
+          cmake -B third_party/llama.cpp/build -S third_party/llama.cpp -C ci/llama-cpp-cache.cmake
+          # -j 2 caps parallel compile jobs to avoid OOM on 16GB runners.
+          cmake --build third_party/llama.cpp/build --target llama-server -j 2 --config Release
+          New-Item -ItemType Directory -Force -Path bin | Out-Null
+          Copy-Item third_party/llama.cpp/build/bin/Release/llama-server.exe bin/
+
+      - name: Sanity check binary
+        if: steps.plan.outputs.skip != 'true' && matrix.kind == 'unix'
+        shell: bash
+        run: bin/llama-server --version
+
+      # ─── Push to GHCR (skipped on PRs and when tag already exists) ──────
+      - name: Push llama-server to GHCR (unix)
+        if: steps.plan.outputs.skip != 'true' && github.event_name != 'pull_request' && matrix.kind == 'unix'
+        shell: bash
+        working-directory: bin
+        run: |
+          oras push "${{ steps.tag.outputs.tag }}" \
+            --artifact-type "application/vnd.runed.llama-server" \
+            llama-server
+
+      - name: Push llama-server.exe to GHCR (windows)
+        if: steps.plan.outputs.skip != 'true' && github.event_name != 'pull_request' && matrix.kind == 'windows'
+        shell: pwsh
+        working-directory: bin
+        run: |
+          oras push "${{ steps.tag.outputs.tag }}" `
+            --artifact-type "application/vnd.runed.llama-server" `
+            llama-server.exe
