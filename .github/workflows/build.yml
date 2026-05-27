@@ -8,25 +8,33 @@ on:
   workflow_dispatch:
 
 jobs:
+  # ─── Vendor llama-server: GHCR pull or fresh build, always artifact ─
+  vendor:
+    uses: ./.github/workflows/build-llama.yml
+    secrets: inherit
+    permissions:
+      contents: read
+      packages: write
+
   build:
+    needs: vendor
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14  # Apple Silicon runner → darwin/arm64
-            goos: darwin
-            goarch: arm64
-          - runner: ubuntu-latest
-            goos: linux
-            goarch: amd64
+          - { runner: macos-14,         goos: darwin, goarch: arm64, smoke: true }
+          - { runner: ubuntu-latest,    goos: linux,  goarch: amd64, smoke: true }
+          - { runner: ubuntu-24.04-arm, goos: linux,  goarch: arm64, smoke: true }
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version-file: go.mod
           check-latest: true
       - uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
       - name: Generate proto
         run: buf generate
       - name: Vet
@@ -38,21 +46,54 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: make build
-      - name: Release tarball
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          VERSION: ${{ github.ref_name }}
-        run: make release-tarball
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+
+      # ─── Smoke gate (uses the vendor job's llama-server artifact) ────
+      - name: Download llama-server
+        if: matrix.smoke
+        uses: actions/download-artifact@v4
         with:
-          name: runed-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: llama-server-${{ matrix.goos }}-${{ matrix.goarch }}
           path: bin/
-      - name: Upload release tarball
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v4
+
+      - name: Ensure llama-server executable
+        if: matrix.smoke
+        shell: bash
+        run: chmod +x bin/llama-server
+
+      - name: Read embedding model pin
+        if: matrix.smoke
+        id: model
+        shell: bash
+        run: |
+          echo "sha256=$(awk '/^sha256:/ {print $2}' .embedding-model.yaml)" >> "$GITHUB_OUTPUT"
+          echo "url=$(awk '/^url:/ {print $2}' .embedding-model.yaml)"       >> "$GITHUB_OUTPUT"
+          echo "file=$(awk '/^file:/ {print $2}' .embedding-model.yaml)"     >> "$GITHUB_OUTPUT"
+
+      - name: Cache embedding model
+        if: matrix.smoke
+        uses: actions/cache@v4
         with:
-          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/
+          path: models
+          key: embedding-model-${{ steps.model.outputs.sha256 }}
+
+      - name: Fetch embedding model (cache miss only)
+        if: matrix.smoke
+        shell: bash
+        env:
+          FILE: ${{ steps.model.outputs.file }}
+          URL:  ${{ steps.model.outputs.url }}
+          SHA:  ${{ steps.model.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p models
+          if [ ! -f "models/${FILE}" ]; then
+            curl -L --fail -o "models/${FILE}" "${URL}"
+          fi
+          echo "${SHA}  models/${FILE}" | shasum -a 256 -c -
+
+      - name: Run integration tests (smoke gate)
+        if: matrix.smoke
+        env:
+          RUNED_TEST_LLAMA_SERVER: ${{ github.workspace }}/bin/llama-server
+          RUNED_TEST_GGUF:         ${{ github.workspace }}/models/${{ steps.model.outputs.file }}
+        run: go test -race -v ./internal/backend ./internal/server -run 'EmbedReturns|ReturnsVector'
