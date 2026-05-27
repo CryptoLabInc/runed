@@ -5,8 +5,10 @@ package backend
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -26,10 +28,21 @@ type Config struct {
 }
 
 type LlamaBackend struct {
-	cfg  Config
+	cfg Config
+
 	cmd  *exec.Cmd
 	port int
-	mu   sync.Mutex
+	mu   sync.Mutex // protects cmd, port — short critical sections only
+
+	// lifecycleMu serializes Start / Stop / EnsureStarted. RPC handlers
+	// call EnsureStarted on every request so the contention here must
+	// stay cheap (a healthy fast-path returns in ~ms).
+	lifecycleMu sync.Mutex
+	// daemonCtx is the long-lived context recorded on the first Start.
+	// EnsureStarted re-spawns the child under this ctx instead of a
+	// short-lived RPC context, so the resurrected llama-server outlives
+	// the request that woke it.
+	daemonCtx context.Context
 }
 
 func NewLlamaBackend(cfg Config) *LlamaBackend {
@@ -63,7 +76,59 @@ func (b *LlamaBackend) CtxSize() int { return b.cfg.CtxSize }
 // We accept either shape: host:port URL form, or explicit "port N" form.
 var portRe = regexp.MustCompile(`(?i)listening on .*?(?::(\d+)\b|port\s+(\d+))`)
 
+// Start launches the llama-server child and waits until it's healthy.
+// The provided ctx is recorded as the daemon-lifetime context — later
+// EnsureStarted calls reuse it so resurrections after idle-suspend run
+// under the original lifetime, not under any short RPC ctx.
 func (b *LlamaBackend) Start(ctx context.Context) error {
+	b.lifecycleMu.Lock()
+	defer b.lifecycleMu.Unlock()
+	b.daemonCtx = ctx
+	return b.startLocked(ctx)
+}
+
+// EnsureStarted brings the backend back up if it's been stopped (idle
+// suspend) or has somehow died. Idempotent — safe to call on every RPC
+// entry: a healthy backend returns within milliseconds (just a quick
+// /health probe under lifecycleMu).
+//
+// Pre-condition: Start has been called at least once so daemonCtx is
+// recorded. Returns an error if the daemonCtx has been cancelled
+// (process shutdown in progress).
+func (b *LlamaBackend) EnsureStarted() error {
+	b.lifecycleMu.Lock()
+	defer b.lifecycleMu.Unlock()
+	if b.daemonCtx == nil {
+		return errors.New("backend not initialized; Start must be called once first")
+	}
+	if err := b.daemonCtx.Err(); err != nil {
+		return fmt.Errorf("backend daemon context done: %w", err)
+	}
+
+	b.mu.Lock()
+	haveCmd := b.cmd != nil
+	b.mu.Unlock()
+	if haveCmd {
+		hctx, cancel := context.WithTimeout(b.daemonCtx, 500*time.Millisecond)
+		defer cancel()
+		if b.IsHealthy(hctx) {
+			return nil
+		}
+		slog.Warn("backend: process alive but unhealthy, restarting")
+		_ = b.stopLocked(context.Background())
+	}
+	slog.Info("backend: cold start (resuming after suspend)")
+	start := time.Now()
+	if err := b.startLocked(b.daemonCtx); err != nil {
+		return err
+	}
+	slog.Info("backend: cold start complete",
+		"port", b.Port(),
+		"duration_ms", time.Since(start).Milliseconds())
+	return nil
+}
+
+func (b *LlamaBackend) startLocked(ctx context.Context) error {
 	args := []string{
 		"--model", b.cfg.ModelPath,
 		"--embeddings",
@@ -89,6 +154,7 @@ func (b *LlamaBackend) Start(ctx context.Context) error {
 	}
 	b.mu.Lock()
 	b.cmd = cmd
+	b.port = 0
 	b.mu.Unlock()
 
 	var logW io.Writer = io.Discard
@@ -147,13 +213,14 @@ func (b *LlamaBackend) Start(ctx context.Context) error {
 		waitErr := cmd.Wait()
 		b.mu.Lock()
 		b.cmd = nil
+		b.port = 0
 		b.mu.Unlock()
 		if waitErr != nil {
 			return fmt.Errorf("llama-server exited before ready: %w", waitErr)
 		}
 		return fmt.Errorf("llama-server exited before ready")
 	case <-ctx.Done():
-		b.Stop(context.Background())
+		_ = b.stopLocked(context.Background())
 		return fmt.Errorf("timed out waiting for llama-server port")
 	}
 
@@ -170,13 +237,14 @@ func (b *LlamaBackend) Start(ctx context.Context) error {
 			waitErr := cmd.Wait()
 			b.mu.Lock()
 			b.cmd = nil
+			b.port = 0
 			b.mu.Unlock()
 			if waitErr != nil {
 				return fmt.Errorf("llama-server exited during health check: %w", waitErr)
 			}
 			return fmt.Errorf("llama-server exited during health check")
 		case <-healthCtx.Done():
-			b.Stop(context.Background())
+			_ = b.stopLocked(context.Background())
 			return fmt.Errorf("llama-server not healthy within deadline")
 		case <-time.After(200 * time.Millisecond):
 		}
@@ -209,7 +277,16 @@ func (b *LlamaBackend) IsHealthy(ctx context.Context) bool {
 	return resp.StatusCode == 200
 }
 
+// Stop terminates the llama-server child if running. After Stop returns,
+// cmd is nil and port is 0 — a subsequent EnsureStarted re-launches the
+// child cleanly.
 func (b *LlamaBackend) Stop(ctx context.Context) error {
+	b.lifecycleMu.Lock()
+	defer b.lifecycleMu.Unlock()
+	return b.stopLocked(ctx)
+}
+
+func (b *LlamaBackend) stopLocked(ctx context.Context) error {
 	cmd := b.getCmd()
 	if cmd == nil || cmd.Process == nil {
 		return nil
@@ -222,6 +299,7 @@ func (b *LlamaBackend) Stop(ctx context.Context) error {
 	clear := func() {
 		b.mu.Lock()
 		b.cmd = nil
+		b.port = 0
 		b.mu.Unlock()
 	}
 
