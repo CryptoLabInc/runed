@@ -111,7 +111,7 @@ func TestServer_InfoMaxTextLengthTracksCtxSize(t *testing.T) {
 
 func TestServer_LastActivity_InitializedAtConstruction(t *testing.T) {
 	before := time.Now()
-	s := New(nil, "vtest", "model-test")
+	s := New(backend.NewLlamaBackend(backend.Config{}), "vtest", "model-test")
 	after := time.Now()
 	got := s.LastActivity()
 	if got.Before(before) || got.After(after) {
@@ -120,7 +120,7 @@ func TestServer_LastActivity_InitializedAtConstruction(t *testing.T) {
 }
 
 func TestServer_TriggerShutdown_Idempotent(t *testing.T) {
-	s := New(nil, "vtest", "model-test")
+	s := New(backend.NewLlamaBackend(backend.Config{}), "vtest", "model-test")
 	// Two concurrent TriggerShutdown calls must not panic (sync.Once).
 	var wg sync.WaitGroup
 	for i := 0; i < 4; i++ {
@@ -140,7 +140,7 @@ func TestServer_TriggerShutdown_Idempotent(t *testing.T) {
 }
 
 func TestServer_UnaryActivityInterceptor_UpdatesLastActivity(t *testing.T) {
-	s := New(nil, "vtest", "model-test")
+	s := New(backend.NewLlamaBackend(backend.Config{}), "vtest", "model-test")
 	initial := s.LastActivity()
 	time.Sleep(2 * time.Millisecond) // ensure new nanosecond bucket
 
