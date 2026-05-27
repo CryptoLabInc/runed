@@ -1,0 +1,9 @@
+# Embedding model pinned for CI smoke tests. Same role as .llama-cpp-version
+# but for the GGUF artifact rather than the inference engine.
+#
+# The sha256 is the cache key (ensures bit-identical fixture across runs)
+# and the integrity check after download. Bump url + sha256 together.
+repo: Qwen/Qwen3-Embedding-0.6B-GGUF
+file: Qwen3-Embedding-0.6B-Q8_0.gguf
+sha256: 06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439
+url: https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf

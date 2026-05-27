@@ -13,12 +13,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14  # Apple Silicon → darwin/arm64
-            goos: darwin
-            goarch: arm64
-          - runner: ubuntu-latest
-            goos: linux
-            goarch: amd64
+          - { runner: macos-14,      goos: darwin, goarch: arm64, smoke: false }
+          - { runner: ubuntu-latest, goos: linux,  goarch: amd64, smoke: true  }
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -38,3 +34,10 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: make build
+
+      # End-to-end smoke test gating each PR. Runs on linux/amd64 only —
+      # the heavy bits (llama.cpp build + GGUF) are GHA-cached, so once
+      # main has populated the cache subsequent PRs hit ~1-2 minutes.
+      - name: Smoke test (PR gate)
+        if: matrix.smoke
+        uses: ./.github/actions/smoke-llama-server

@@ -1,0 +1,67 @@
+name: Smoke test runed via llama-server
+description: |
+  Cache + build llama-server (via Makefile), cache + fetch the pinned
+  embedding model, and run the Go integration tests that exercise the
+  full spawn → embed → vector path.
+
+  Unix-only (uses make and curl). Skip from Windows callers.
+
+  Pins consumed:
+    .llama-cpp-version    — llama.cpp ref
+    .embedding-model.yaml — model url + sha256
+
+runs:
+  using: composite
+  steps:
+    - name: Read pinned llama.cpp ref
+      id: llama
+      shell: bash
+      run: echo "ref=$(cat .llama-cpp-version)" >> "$GITHUB_OUTPUT"
+
+    - name: Read pinned embedding model
+      id: model
+      shell: bash
+      run: |
+        sha256=$(awk '/^sha256:/ {print $2}' .embedding-model.yaml)
+        url=$(awk '/^url:/ {print $2}' .embedding-model.yaml)
+        file=$(awk '/^file:/ {print $2}' .embedding-model.yaml)
+        echo "sha256=${sha256}" >> "$GITHUB_OUTPUT"
+        echo "url=${url}"       >> "$GITHUB_OUTPUT"
+        echo "file=${file}"     >> "$GITHUB_OUTPUT"
+
+    - name: Cache llama.cpp source + build
+      uses: actions/cache@v4
+      with:
+        path: third_party/llama.cpp
+        key: llamacpp-${{ steps.llama.outputs.ref }}-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Cache embedding model
+      uses: actions/cache@v4
+      with:
+        path: models
+        key: embedding-model-${{ steps.model.outputs.sha256 }}
+
+    - name: Build llama-server
+      shell: bash
+      run: make llama-server
+
+    - name: Fetch embedding model (cache miss only)
+      shell: bash
+      env:
+        FILE: ${{ steps.model.outputs.file }}
+        URL:  ${{ steps.model.outputs.url }}
+        SHA:  ${{ steps.model.outputs.sha256 }}
+      run: |
+        set -euo pipefail
+        mkdir -p models
+        if [ ! -f "models/${FILE}" ]; then
+          curl -L --fail -o "models/${FILE}" "${URL}"
+        fi
+        echo "${SHA}  models/${FILE}" | shasum -a 256 -c -
+
+    - name: Run integration tests
+      shell: bash
+      env:
+        RUNED_TEST_LLAMA_SERVER: ${{ github.workspace }}/bin/llama-server
+        RUNED_TEST_GGUF:         ${{ github.workspace }}/models/${{ steps.model.outputs.file }}
+      run: go test -race -v ./internal/backend ./internal/server -run 'EmbedReturns|ReturnsVector'
