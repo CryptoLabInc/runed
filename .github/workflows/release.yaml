@@ -66,6 +66,8 @@ jobs:
 
       - uses: bufbuild/buf-setup-action@v1
         if: matrix.kind == 'tarball'
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Smoke test + build llama-server
         if: matrix.kind == 'tarball'
