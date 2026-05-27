@@ -80,4 +80,3 @@ func TestConnect_WithNoSpawn_FailsFastWhenNoDaemon(t *testing.T) {
 		t.Fatal("expected error with WithNoSpawn and no daemon, got nil")
 	}
 }
-
