@@ -82,6 +82,16 @@ func EnsureDaemon(ctx context.Context, socketPath string) error {
 // sufficient evidence that a listener exists. The actual Health RPC
 // happens later when the caller's Connect runs.
 func probeDaemon(ctx context.Context, socketPath string) (dialResult, error) {
+	// Pre-flight stat: if the path exists but isn't a socket, classify as
+	// hostile before attempting the dial. Linux returns ECONNREFUSED for
+	// dialing a regular file (which our errors.Is below would otherwise
+	// fold into dialAbsent and trigger an auto-spawn that clobbers the
+	// existing file); macOS returns ENOTSOCK. Stat-first removes the OS
+	// difference. Mirrors the same check ipc.Listen performs server-side.
+	if info, err := os.Stat(socketPath); err == nil && info.Mode()&os.ModeSocket == 0 {
+		return dialHostile, fmt.Errorf("probe %s: path exists but is not a socket", socketPath)
+	}
+
 	cctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
 	var d net.Dialer
@@ -94,7 +104,7 @@ func probeDaemon(ctx context.Context, socketPath string) (dialResult, error) {
 	if errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED) {
 		return dialAbsent, nil
 	}
-	// Hostile: anything else (EACCES, ENOTSOCK, etc.) — don't spawn.
+	// Hostile: anything else (EACCES, etc.) — don't spawn.
 	return dialHostile, fmt.Errorf("probe %s: %w", socketPath, err)
 }
 
