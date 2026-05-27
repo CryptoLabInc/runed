@@ -5,17 +5,164 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Skip GitHub Release upload'
+        required: false
+        default: 'true'
+        type: boolean
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  release:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Full-stack tarballs: runed + rundemo + llama-server.
+          - runner: macos-14
+            goos: darwin
+            goarch: arm64
+            llama_build: make
+            artifact: tarball
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            llama_build: make
+            artifact: tarball
+          # Windows: llama-server.exe only (runed.exe blocked on Plan B work).
+          - runner: windows-latest
+            goos: windows
+            goarch: amd64
+            llama_build: cmake-direct
+            artifact: llama-server-only
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned llama.cpp ref
+        id: llama
+        shell: bash
+        run: echo "ref=$(cat .llama-cpp-version)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve version
+        id: meta
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION=$(git describe --tags --always 2>/dev/null || echo dev)
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      # ─── Go toolchain + proto ─────────────────────────────────────────────
+      - uses: actions/setup-go@v5
+        if: matrix.artifact == 'tarball'
+        with:
+          go-version: '1.22'
+          check-latest: true
+
+      - uses: bufbuild/buf-setup-action@v1
+        if: matrix.artifact == 'tarball'
+
+      # ─── llama.cpp source + build cache ───────────────────────────────────
+      - name: Cache llama.cpp build
+        uses: actions/cache@v4
+        with:
+          path: third_party/llama.cpp
+          key: llamacpp-${{ steps.llama.outputs.ref }}-${{ matrix.goos }}-${{ matrix.goarch }}
+
+      - name: Clone llama.cpp (cache miss)
+        if: matrix.llama_build == 'cmake-direct'
+        shell: bash
+        run: |
+          if [ ! -d "third_party/llama.cpp/.git" ]; then
+            mkdir -p third_party
+            git clone --depth 1 --branch ${{ steps.llama.outputs.ref }} \
+              https://github.com/ggml-org/llama.cpp third_party/llama.cpp
+          fi
+
+      # ─── Build llama-server ───────────────────────────────────────────────
+      - name: Build llama-server (make, unix)
+        if: matrix.llama_build == 'make'
+        run: make llama-server
+
+      - name: Build llama-server (cmake, windows)
+        if: matrix.llama_build == 'cmake-direct'
+        shell: pwsh
+        run: |
+          cmake -B third_party/llama.cpp/build -S third_party/llama.cpp -C ci/llama-cpp-cache.cmake
+          cmake --build third_party/llama.cpp/build --target llama-server -j --config Release
+          New-Item -ItemType Directory -Force -Path bin | Out-Null
+          Copy-Item third_party/llama.cpp/build/bin/Release/llama-server.exe bin/
+
+      # ─── Build runed + rundemo (tarball matrix only) ──────────────────────
+      - name: Build runed binaries
+        if: matrix.artifact == 'tarball'
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: make build
+
+      # ─── Package ──────────────────────────────────────────────────────────
+      - name: Package tarball (unix)
+        if: matrix.artifact == 'tarball'
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: make release-tarball
+
+      - name: Package llama-server zip (windows)
+        if: matrix.artifact == 'llama-server-only'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $name = "llama-server-${{ steps.meta.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}.zip"
+          Compress-Archive -Path bin/llama-server.exe -DestinationPath "dist/$name"
+          $hash = (Get-FileHash "dist/$name" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name" | Out-File -Encoding ascii "dist/$name.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' || inputs.dry_run == 'false'
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      # TODO: fetch release tarballs produced by the build workflow
-      #       (or rebuild here for darwin/arm64 + linux/amd64).
-      # TODO: create a GitHub Release for the pushed tag and attach
-      #       the tarballs as release assets.
-      - name: Stub
-        run: echo "release workflow stub — implementation TBD"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Resolve version
+        id: meta
+        run: echo "version=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: dist/
+        run: |
+          gh release create "${{ steps.meta.outputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ steps.meta.outputs.version }}" \
+            --generate-notes \
+            *.tar.gz *.zip *.sha256
