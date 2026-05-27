@@ -14,7 +14,12 @@
 //	RUNED_CTX_SIZE        Max input length in tokens; lower = less KV-cache memory (default: 2048).
 //	RUNED_MODEL_VARIANT   Override manifest.default_model (e.g. "qwen3-embedding-0.6b.q8_0").
 //	RUNED_MANIFEST        Manifest URL for self-bootstrap. Overrides DefaultManifestURL baked at build.
-//	RUNED_IDLE_TIMEOUT    Idle exit duration (default: 10m; "0" disables).
+//	RUNED_IDLE_TIMEOUT    Idle duration after which llama-server is stopped to
+//	                      release model weights from memory. runed itself
+//	                      stays up; the next Embed/EmbedBatch RPC resurrects
+//	                      the backend via backend.EnsureStarted (cold-start
+//	                      latency paid only on that first post-idle request).
+//	                      Default 10m; "0" disables backend suspend.
 //
 // The daemon listens on $RUNED_HOME/embedding.sock (UDS) and terminates
 // gracefully on SIGINT, SIGTERM, or a Shutdown RPC. Graceful termination
@@ -173,11 +178,16 @@ func run() error {
 		return fmt.Errorf("RUNED_IDLE_TIMEOUT: %w", err)
 	}
 	if idleTimeout > 0 {
-		logger.Info("idle exit enabled", "timeout", idleTimeout.String())
+		logger.Info("idle backend-suspend enabled", "timeout", idleTimeout.String())
 		go func() {
-			// Tick at 30s; idle-exit latency is therefore RUNED_IDLE_TIMEOUT + up to 30s.
-			// Cadence is chosen to keep wake-up overhead negligible on long-idle daemons;
-			// values < 30s of RUNED_IDLE_TIMEOUT will still see ~30s of post-idle slack.
+			// Idle policy: when no RPC arrives for RUNED_IDLE_TIMEOUT, stop the
+			// llama-server child to release its memory (~470MB+ of model
+			// weights). runed itself stays up so the gRPC socket remains
+			// reachable — the next Embed/EmbedBatch RPC triggers
+			// backend.EnsureStarted which re-spawns llama-server, paying a
+			// cold-start latency hit (~hundreds of ms) only on that first
+			// post-idle request. Ticker cadence is 30s, so observed suspend
+			// latency is RUNED_IDLE_TIMEOUT + up to 30s.
 			ticker := time.NewTicker(30 * time.Second)
 			defer ticker.Stop()
 			for {
@@ -186,17 +196,23 @@ func run() error {
 					return
 				case <-ticker.C:
 					elapsed := time.Since(srv.LastActivity())
-					if elapsed > idleTimeout {
-						logger.Info("idle timeout reached, triggering shutdown",
-							"elapsed", elapsed.String())
-						srv.TriggerShutdown()
-						return
+					if elapsed <= idleTimeout {
+						continue
+					}
+					if !b.IsHealthy(ctx) {
+						// Already suspended; nothing to do.
+						continue
+					}
+					logger.Info("idle backend-suspend: stopping llama-server",
+						"elapsed", elapsed.String())
+					if err := b.Stop(ctx); err != nil {
+						logger.Warn("backend stop failed", "err", err)
 					}
 				}
 			}
 		}()
 	} else {
-		logger.Info("idle exit disabled (RUNED_IDLE_TIMEOUT=0)")
+		logger.Info("idle backend-suspend disabled (RUNED_IDLE_TIMEOUT=0)")
 	}
 
 	sigCh := make(chan os.Signal, 1)
