@@ -1,0 +1,46 @@
+name: build-llama
+
+# Stub for the vendor prebuild workflow.
+#
+# Intent: this workflow will, when triggered manually, build llama-server
+# from the ref pinned in .llama-cpp-version for every supported platform and
+# publish the binaries (plus the embedding model GGUF pinned in
+# .embedding-model.yaml) as OCI artifacts under
+# ghcr.io/CryptoLabInc/runed/* . The build.yml and release.yaml workflows
+# will then pull from GHCR instead of building llama.cpp on every run.
+#
+# Rationale: llama.cpp + GGUF model rarely change. Building them on every
+# PR (~5min linux, ~20min macOS first time) is wasted work, and the
+# actions/cache 7-day eviction means a single slow week recreates the cost.
+# A workflow_dispatch-only prerequisite that pushes to GHCR makes the
+# artifacts effectively permanent.
+#
+# This stub exists so the workflow file is present on main and can be
+# referenced by future PRs. Implementation lands in a follow-up PR.
+
+on:
+  workflow_dispatch:
+    inputs:
+      llama_cpp_ref:
+        description: 'llama.cpp ref to build (default: read from .llama-cpp-version)'
+        required: false
+        type: string
+      embedding_model_sha:
+        description: 'Embedding model sha256 (default: read from .embedding-model.yaml)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write   # required to push OCI artifacts to ghcr.io
+
+jobs:
+  stub:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Placeholder
+        run: |
+          echo "build-llama is a stub — implementation lands in a follow-up PR."
+          echo "Inputs received (for reference):"
+          echo "  llama_cpp_ref:       ${{ inputs.llama_cpp_ref }}"
+          echo "  embedding_model_sha: ${{ inputs.embedding_model_sha }}"
