@@ -192,4 +192,5 @@ jobs:
             --repo "${{ github.repository }}" \
             --title "${{ steps.meta.outputs.version }}" \
             --generate-notes \
+            --prerelease \
             *.tar.gz *.zip *.sha256
