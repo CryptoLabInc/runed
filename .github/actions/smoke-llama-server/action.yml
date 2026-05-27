@@ -1,25 +1,21 @@
 name: Smoke test runed via llama-server
 description: |
-  Prepare llama-server + pinned embedding model, then run the Go
-  integration tests that exercise the full spawn → embed → vector path.
+  Pull the pinned llama-server binary from GHCR, fetch the pinned
+  embedding model (GHA-cached), and run the Go integration tests that
+  exercise the full spawn → embed → vector path.
 
-  Source preference order:
-    llama-server:
-      1. GHCR (ghcr.io/${repo}/llama-server:<ref>-<os>-<arch>) — published
-         by the build-llama workflow; effectively permanent, ~5s pull.
-      2. actions/cache hit — populated by a previous run; 7-day eviction.
-      3. Local build (make llama-server) — slowest, ~5-20min on first run.
-    embedding model:
-      1. actions/cache hit (keyed by sha256).
-      2. Direct curl from .embedding-model.yaml's URL.
-      (Not vendored to GHCR — passthrough fetch, no build value to mirror.)
+  llama-server source: GHCR only (ghcr.io/${repo}/llama-server:
+  <ref>-<os>-<arch>). The build-llama workflow is responsible for
+  publishing it; missing tags fail this step deliberately rather than
+  silently rebuilding — keeping smoke runs predictable in cost (~5s
+  per matrix entry).
 
-  Until build-llama is fully wired up the GHCR pull always misses and the
-  composite falls through to (2) / (3); behavior is unchanged from before
-  this change, but the workflow file is already structured for the
-  permanent-cache path so PR-vendor only needs to flip a switch.
+  embedding model: actions/cache (keyed by sha256) → curl fetch on
+  miss. Not vendored to GHCR — passthrough HF download, no build
+  artifact to mirror.
 
-  Unix-only (uses make, curl, oras). Skip from Windows callers.
+  Unix-only (uses oras, curl, shasum). Windows callers handle their
+  own llama-server.exe.
 
   Pins consumed:
     .llama-cpp-version    — llama.cpp ref
@@ -57,13 +53,18 @@ runs:
         echo "os=${os}"     >> "$GITHUB_OUTPUT"
         echo "arch=${arch}" >> "$GITHUB_OUTPUT"
 
-    # ─── Tier 1: GHCR (effectively permanent) ─────────────────────────────
+    # ─── llama-server: GHCR pull (no fallback) ──────────────────────────
     - name: Install oras
       uses: oras-project/setup-oras@v1
 
-    - name: Try GHCR pull (llama-server)
-      id: ghcr_llama
-      continue-on-error: true
+    - name: Login to GHCR
+      shell: bash
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+    - name: Pull llama-server from GHCR
       shell: bash
       env:
         REPO: ${{ github.repository }}
@@ -73,32 +74,19 @@ runs:
       run: |
         set -euo pipefail
         mkdir -p bin
-        # Lowercase repo name (ghcr.io requires it).
         ref_repo=$(echo "${REPO}" | tr '[:upper:]' '[:lower:]')
         ref="ghcr.io/${ref_repo}/llama-server:${REF}-${OS}-${ARCH}"
-        echo "Trying GHCR pull: ${ref}"
+        echo "Pulling ${ref}"
         oras pull --output bin "${ref}"
         chmod +x bin/llama-server
         bin/llama-server --version
 
-    # ─── Tier 2: GHA cache + Tier 3: local build / direct fetch ───────────
-    - name: Cache llama.cpp source + build
-      if: steps.ghcr_llama.outcome == 'failure'
-      uses: actions/cache@v4
-      with:
-        path: third_party/llama.cpp
-        key: llamacpp-${{ steps.llama.outputs.ref }}-${{ runner.os }}-${{ runner.arch }}
-
+    # ─── embedding model: cache + curl fetch ────────────────────────────
     - name: Cache embedding model
       uses: actions/cache@v4
       with:
         path: models
         key: embedding-model-${{ steps.model.outputs.sha256 }}
-
-    - name: Build llama-server (fallback)
-      if: steps.ghcr_llama.outcome == 'failure'
-      shell: bash
-      run: make llama-server
 
     - name: Fetch embedding model (cache miss only)
       shell: bash
