@@ -122,11 +122,16 @@ func launchDaemon(cfg *Config, socketPath string) error {
 		return fmt.Errorf("open daemon log: %w", err)
 	}
 	cmd := exec.Command(cfg.RunedBinary)
-	env := append(os.Environ(),
-		"RUNED_LLAMA_SERVER="+cfg.LlamaServer,
-		"RUNED_MODEL="+cfg.Model,
-		"RUNED_HOME="+home,
-	)
+	env := append(os.Environ(), "RUNED_HOME="+home)
+	// Only propagate LlamaServer / Model when the caller explicitly set
+	// them. Empty values would override the daemon's own self-bootstrap
+	// resolution and force a guaranteed-broken startup.
+	if cfg.LlamaServer != "" {
+		env = append(env, "RUNED_LLAMA_SERVER="+cfg.LlamaServer)
+	}
+	if cfg.Model != "" {
+		env = append(env, "RUNED_MODEL="+cfg.Model)
+	}
 	if cfg.IdleTimeout != "" {
 		env = append(env, "RUNED_IDLE_TIMEOUT="+cfg.IdleTimeout)
 	}

@@ -18,6 +18,26 @@ ifeq ($(shell uname -s),Darwin)
 LLAMA_CMAKE_EXTRA += -DGGML_BLAS=ON
 endif
 
+# DEFAULT_MANIFEST_URL is baked into the binary so end users don't need to
+# set RUNED_MANIFEST themselves. Leave empty for dev builds (env-required);
+# release builds should pass the production URL.
+DEFAULT_MANIFEST_URL ?=
+
+# DEFAULT_RUNED_BINARY is the fallback path the spawn package uses when no
+# `runed` is on PATH and config.json doesn't specify one. ~/.runed/bin/runed
+# matches where `rune install` places it, so dev and release builds share
+# the same default — dev builds expect you to symlink your fork binary
+# into that location (scripts/dev_standalone.sh does this for you).
+DEFAULT_RUNED_BINARY ?= $(HOME)/.runed/bin/runed
+
+LDFLAGS := -X main.daemonVersion=$(VERSION)
+ifneq ($(DEFAULT_MANIFEST_URL),)
+LDFLAGS += -X github.com/CryptoLabInc/runed/internal/bootstrap.DefaultManifestURL=$(DEFAULT_MANIFEST_URL)
+endif
+ifneq ($(DEFAULT_RUNED_BINARY),)
+LDFLAGS += -X github.com/CryptoLabInc/runed/internal/spawn.DefaultRunedBinary=$(DEFAULT_RUNED_BINARY)
+endif
+
 all: build
 
 proto:
@@ -26,9 +46,15 @@ proto:
 build: proto
 	mkdir -p bin
 	GOOS=$(GOOS) GOARCH=$(GOARCH) go build \
-		-ldflags "-X main.daemonVersion=$(VERSION)" \
+		-ldflags "$(LDFLAGS)" \
 		-o bin/runed ./cmd/runed
-	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -o bin/rundemo ./cmd/rundemo
+	# rundemo (and any future client binary) needs the same ldflags so spawn's
+	# DefaultRunedBinary / DefaultManifestURL are reachable from the client side.
+	# Unknown -X targets (main.daemonVersion isn't defined in rundemo) are silently
+	# ignored by the linker.
+	GOOS=$(GOOS) GOARCH=$(GOARCH) go build \
+		-ldflags "$(LDFLAGS)" \
+		-o bin/rundemo ./cmd/rundemo
 
 # Clone (shallow) and CPU-build llama-server at the pinned ref.
 # Unix-only target — Windows CI invokes cmake directly because make/sh aren't

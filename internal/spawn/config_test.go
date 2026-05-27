@@ -116,10 +116,70 @@ func TestLoadConfig_ModelNotGGUF(t *testing.T) {
 	}
 }
 
-func TestLoadConfig_MissingFile(t *testing.T) {
+// TestLoadConfig_MissingFile_NoFallback: with no config file, no PATH
+// match, and no DefaultRunedBinary baked in, LoadConfig should fail with
+// the unresolved-runed_binary error.
+func TestLoadConfig_MissingFile_NoFallback(t *testing.T) {
 	t.Setenv("RUNED_CONFIG", "/tmp/definitely-does-not-exist-runed-config.json")
+	t.Setenv("PATH", "/nonexistent")
+	saved := DefaultRunedBinary
+	DefaultRunedBinary = ""
+	t.Cleanup(func() { DefaultRunedBinary = saved })
+
 	_, err := LoadConfig()
-	if err == nil || !strings.Contains(err.Error(), "not found") {
-		t.Fatalf("expected not-found error, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "unresolved") {
+		t.Fatalf("expected runed_binary unresolved error, got: %v", err)
+	}
+}
+
+// TestLoadConfig_MissingFile_UsesDefaultRunedBinary: with no config file
+// but DefaultRunedBinary baked in (the release/dev build case), LoadConfig
+// returns a valid config with LlamaServer/Model unset — the daemon will
+// self-bootstrap those.
+func TestLoadConfig_MissingFile_UsesDefaultRunedBinary(t *testing.T) {
+	dir := t.TempDir()
+	runedBin := writeFile(t, dir, "runed", []byte("#!/bin/sh\n"), true)
+
+	t.Setenv("RUNED_CONFIG", filepath.Join(dir, "nope.json"))
+	t.Setenv("PATH", "/nonexistent")
+	saved := DefaultRunedBinary
+	DefaultRunedBinary = runedBin
+	t.Cleanup(func() { DefaultRunedBinary = saved })
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.LlamaServer != "" || cfg.Model != "" {
+		t.Errorf("expected empty LlamaServer/Model (self-bootstrap), got %q/%q",
+			cfg.LlamaServer, cfg.Model)
+	}
+	if cfg.RunedBinary != runedBin {
+		t.Errorf("RunedBinary = %q; want %q", cfg.RunedBinary, runedBin)
+	}
+}
+
+// TestLoadConfig_OptionalLlamaServerAndModel: a config that sets only
+// runed_binary and omits llama_server/model parses successfully — those
+// fields delegate to the daemon's self-bootstrap.
+func TestLoadConfig_OptionalLlamaServerAndModel(t *testing.T) {
+	dir := t.TempDir()
+	runedBin := writeFile(t, dir, "runed", []byte("#!/bin/sh\n"), true)
+	cfgPath := writeFile(t, dir, "config.json", []byte(`{
+        "version": 1,
+        "runed_binary": "`+runedBin+`"
+    }`), false)
+	t.Setenv("RUNED_CONFIG", cfgPath)
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.LlamaServer != "" || cfg.Model != "" {
+		t.Errorf("expected empty LlamaServer/Model, got %q/%q",
+			cfg.LlamaServer, cfg.Model)
+	}
+	if cfg.RunedBinary != runedBin {
+		t.Errorf("RunedBinary = %q; want %q", cfg.RunedBinary, runedBin)
 	}
 }
