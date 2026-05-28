@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // ExtractTarGz extracts srcPath into destDir, creating destDir if needed.
@@ -47,15 +46,17 @@ func ExtractTarGz(srcPath, destDir string) ([]string, error) {
 		if err != nil {
 			return extracted, fmt.Errorf("extract: tar next: %w", err)
 		}
-		name := filepath.ToSlash(hdr.Name)
-		if name == "" || strings.Contains(name, "..") {
+		// filepath.IsLocal (Go 1.20+) rejects absolute paths, any segment
+		// that would escape via "..", empty paths, and Windows reserved/UNC
+		// forms in one shot — replaces the prior strings.Contains + Rel
+		// pair, which also over-rejected legitimate names like "foo..bar".
+		// Sufficient here because the archive is fetched via a trusted
+		// manifest and SHA-256 verified before extraction.
+		name := filepath.FromSlash(hdr.Name)
+		if !filepath.IsLocal(name) {
 			continue
 		}
-		dest := filepath.Join(destAbs, filepath.FromSlash(name))
-		rel, err := filepath.Rel(destAbs, dest)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			continue
-		}
+		dest := filepath.Join(destAbs, name)
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			mode := os.FileMode(hdr.Mode) & 0o777
