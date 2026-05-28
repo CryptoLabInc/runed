@@ -27,9 +27,8 @@ const (
 	maxBatchSize int32 = 32
 )
 
-// bootstrapState is the snapshot fed to Health while STATUS_LOADING.
-// Treated as immutable once stored — SetBootstrapStatus replaces the
-// whole pointer atomically so readers always see a consistent tuple.
+// bootstrapState is replaced atomically so Health sees a consistent
+// {phase, bytes, message} tuple in a single load.
 type bootstrapState struct {
 	phase      runedv1.HealthResponse_Phase
 	bytesDone  int64
@@ -37,55 +36,42 @@ type bootstrapState struct {
 	message    string
 }
 
-// Server implements runedv1.RunedServiceServer. It does not own the backend
-// lifecycle — callers (cmd/runed) construct New(), drive self-bootstrap while
-// the gRPC socket already listens (Health reports STATUS_LOADING during that
-// window), then call SetBackend once llama-server is up.
+// Server implements runedv1.RunedServiceServer. Callers (cmd/runed)
+// construct New(), then SetBackend once llama-server is up; Health
+// reports STATUS_LOADING in between.
 type Server struct {
 	runedv1.UnimplementedRunedServiceServer
 
-	// backend is nil until SetBackend is called. Embed/EmbedBatch return
-	// FAILED_PRECONDITION while nil; Health returns STATUS_LOADING.
+	// nil until SetBackend; while nil Embed returns FAILED_PRECONDITION
+	// and Health returns STATUS_LOADING.
 	backend atomic.Pointer[backend.LlamaBackend]
 
 	version   string
 	startedAt time.Time
 
-	// modelIdentity is "" until SetBackend computes the model SHA. Stored
-	// via atomic.Value so Info readers don't race the writer.
+	// "" until SetBackend; atomic so concurrent Info reads don't race.
 	modelIdentity atomic.Value // string
 
-	// maxTextLength (chars) is sourced from the backend's ctx-size (tokens)
-	// at SetBackend time; chars==tokens is conservative (dense text is
-	// ≥~1.27 chars/token), so it always fits ctx. Advertised via Info; reads
-	// 0 before bootstrap completes since the value depends on llama-server's
-	// loaded config.
+	// chars equal to backend ctx-size in tokens — chars/token ratio is
+	// ≥~1.27 so chars==tokens always fits ctx. 0 before SetBackend.
 	maxTextLength atomic.Int32
 
-	// bootstrapStatus is updated during self-bootstrap and read by Health
-	// when backend is still nil. nil before any update.
+	// nil before any SetBootstrapStatus call.
 	bootstrapStatus atomic.Pointer[bootstrapState]
 
-	// requests counts Embed + EmbedBatch calls (post-entry, pre-return).
-	// Exposed through HealthResponse.total_requests so clients can observe
-	// daemon throughput without scraping logs.
+	// Embed + EmbedBatch counter. Surfaced via HealthResponse.total_requests.
 	requests atomic.Int64
 
-	// shutdownOnce guarantees close(shutdownCh) runs exactly once even under
-	// a flurry of concurrent Shutdown RPCs (double-close panics).
+	// sync.Once guards close(shutdownCh) against double-close.
 	shutdownOnce sync.Once
 	shutdownCh   chan struct{}
 
-	// lastActivity records the UnixNano timestamp of the most recent RPC
-	// entry (set by UnaryActivityInterceptor). Used by the idle-exit ticker
-	// in cmd/runed to decide when to call TriggerShutdown.
+	// UnixNano of the most recent RPC; read by cmd/runed's idle ticker.
 	lastActivity atomic.Int64
 }
 
-// New returns a Server with backend unset. Until SetBackend is called,
-// Embed/EmbedBatch return FAILED_PRECONDITION and Health reports
-// STATUS_LOADING + whatever phase the latest SetBootstrapStatus posted.
-// modelIdentity is empty until SetBackend supplies it.
+// New returns a Server with backend unset; SetBackend wires it after
+// bootstrap completes.
 func New(version string) *Server {
 	s := &Server{
 		version:    version,
@@ -97,24 +83,18 @@ func New(version string) *Server {
 	return s
 }
 
-// SetBackend wires the backend and model identity after self-bootstrap
-// completes. From this point on, Embed/EmbedBatch are accepted and
-// Health reports STATUS_OK (or STATUS_DEGRADED if IsHealthy fails). Safe
-// to call concurrently with in-flight RPCs — readers see a consistent
-// transition because maxTextLength and modelIdentity are written before
-// the backend pointer is published.
+// SetBackend wires the backend after bootstrap. maxTextLength and
+// modelIdentity are written before backend.Store so any reader seeing
+// the backend pointer necessarily sees the other two.
 func (s *Server) SetBackend(b *backend.LlamaBackend, modelIdentity string) {
 	s.maxTextLength.Store(int32(b.CtxSize()))
 	s.modelIdentity.Store(modelIdentity)
 	s.backend.Store(b)
 }
 
-// SetBootstrapStatus records the current self-bootstrap phase and download
-// progress. The next Health RPC returns these fields when STATUS_LOADING.
-// Callers (cmd/runed + bootstrap reporter) emit one update per phase
-// transition and periodically during long downloads. bytesTotal == 0
-// means total size isn't yet known (e.g. before HTTP Content-Length is
-// read); clients should render percent-complete only when total > 0.
+// SetBootstrapStatus updates the Phase / bytes / message that the next
+// Health call returns under STATUS_LOADING. bytesTotal == 0 means the
+// total size isn't yet known (no Content-Length observed yet).
 func (s *Server) SetBootstrapStatus(phase runedv1.HealthResponse_Phase, bytesDone, bytesTotal int64, message string) {
 	s.bootstrapStatus.Store(&bootstrapState{
 		phase:      phase,
@@ -198,28 +178,13 @@ func shortMethod(fullMethod string) string {
 // loop forever.
 const embedMaxAttempts = 2
 
-// Embed delegates to the backend's single-text embedding path.
-// The proto dropped the normalize field (see commit 816ef81); the backend is
-// called with normalize=true as a harmless default since llama-server always
-// returns L2-normalized vectors anyway.
+// Embed returns FAILED_PRECONDITION (not Unavailable) before SetBackend
+// so client retry policies don't burn budget against a multi-minute
+// bootstrap.
 //
-// Returns FAILED_PRECONDITION when the backend hasn't been wired yet
-// (self-bootstrap still in progress). codes.FailedPrecondition (not
-// Unavailable) intentionally bypasses default-retry policies — bootstrap
-// can take minutes, so short exponential backoffs would just exhaust
-// retries pre-ready. Whether clients fast-fail or poll Health is the
-// client's concern; the error message stays neutral on retry strategy.
-//
-// Once the backend is wired it may still be suspended by the idle-
-// suspend ticker. EnsureStarted resurrects it under the daemon-lifetime
-// context — the first request after a suspend pays llama-server cold-
-// start latency (~hundreds of ms to a few seconds for model load);
-// subsequent requests fall through the cheap health-probe fast path.
-//
-// Retry loop: backend.Embed holds inflightMu.RLock so Stop can't kill
-// an in-flight HTTP. The remaining race window is EnsureStarted-return
-// → RLock-acquire; if Stop slips into that gap we get ErrNotStarted on
-// the first attempt and recover by re-running EnsureStarted once.
+// After wiring, EnsureStarted handles idle-suspend wake-up. The retry
+// loop covers the EnsureStarted-return → RLock-acquire race where Stop
+// slips in and surfaces ErrNotStarted.
 func (s *Server) Embed(ctx context.Context, req *runedv1.EmbedRequest) (*runedv1.EmbedResponse, error) {
 	b := s.backend.Load()
 	if b == nil {
@@ -241,11 +206,8 @@ func (s *Server) Embed(ctx context.Context, req *runedv1.EmbedRequest) (*runedv1
 	return nil, fmt.Errorf("backend kept suspending between EnsureStarted and Embed")
 }
 
-// EmbedBatch delegates to the backend's batch path and wraps each vector in
-// an EmbedResponse so the proto response message stays composable with
-// single-text Embed. Returns FAILED_PRECONDITION when the backend hasn't
-// been wired yet; see Embed godoc for the EnsureStarted / ErrNotStarted
-// retry rationale.
+// EmbedBatch is the batch variant of Embed; see Embed for behaviour
+// during bootstrap and idle-suspend.
 func (s *Server) EmbedBatch(ctx context.Context, req *runedv1.EmbedBatchRequest) (*runedv1.EmbedBatchResponse, error) {
 	b := s.backend.Load()
 	if b == nil {
@@ -273,11 +235,9 @@ func (s *Server) EmbedBatch(ctx context.Context, req *runedv1.EmbedBatchRequest)
 	return nil, fmt.Errorf("backend kept suspending between EnsureStarted and EmbedBatch")
 }
 
-// Info returns static daemon metadata. Does not touch the backend — safe to
-// call before SetBackend or during a DEGRADED state. MaxTextLength reads 0
-// before bootstrap completes since the value depends on llama-server's
-// loaded ctx-size; clients should re-query Info after Health reports
-// STATUS_OK if they need the final value.
+// Info returns static daemon metadata. MaxTextLength reads 0 before
+// SetBackend; clients needing the final value should re-query after
+// Health reports STATUS_OK.
 func (s *Server) Info(ctx context.Context, _ *runedv1.InfoRequest) (*runedv1.InfoResponse, error) {
 	mid, _ := s.modelIdentity.Load().(string)
 	return &runedv1.InfoResponse{
@@ -289,21 +249,13 @@ func (s *Server) Info(ctx context.Context, _ *runedv1.InfoRequest) (*runedv1.Inf
 	}, nil
 }
 
-// Health maps backend readiness onto the proto Status enum:
+// Health maps backend state to the proto Status enum. SHUTTING_DOWN
+// outranks LOADING/DEGRADED/OK so a drain-in-progress daemon doesn't
+// advertise itself as ready (the GracefulStop race would otherwise
+// surface Unavailable right after the OK response).
 //
-//   - shutdown signalled (Shutdown RPC / TriggerShutdown) → STATUS_SHUTTING_DOWN
-//   - backend not yet wired                              → STATUS_LOADING +
-//     Phase / bytes / message populated from the most recent
-//     SetBootstrapStatus
-//   - backend wired but unhealthy                         → STATUS_DEGRADED
-//   - backend wired and healthy                           → STATUS_OK
-//
-// SHUTTING_DOWN is checked first so a drain-in-progress daemon doesn't
-// advertise itself as ready (callers that read OK during the GracefulStop
-// race would otherwise send a request just to receive Unavailable).
-//
-// Never returns an error so clients can always read uptime as a liveness
-// signal and treat any RPC success as proof the daemon process exists.
+// Never returns an error — clients can read uptime as a liveness signal
+// even when the other fields are zero-valued.
 func (s *Server) Health(ctx context.Context, _ *runedv1.HealthRequest) (*runedv1.HealthResponse, error) {
 	resp := &runedv1.HealthResponse{
 		UptimeSeconds: int64(time.Since(s.startedAt).Seconds()),

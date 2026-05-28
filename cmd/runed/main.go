@@ -114,12 +114,10 @@ func run() error {
 		}
 	}
 
-	// Build the server and start serving the UDS BEFORE self-bootstrap +
-	// backend.Start so clients can dial immediately and poll Health for
-	// STATUS_LOADING / Phase / progress instead of seeing dial failures
-	// during the multi-minute install window. SetBackend wires the
-	// backend at the end; until then Embed/EmbedBatch return
-	// FAILED_PRECONDITION.
+	// Listen before self-bootstrap so clients can poll Health for
+	// STATUS_LOADING + Phase/progress instead of dial failures during
+	// the multi-minute install window. SetBackend below flips Health
+	// to STATUS_OK once llama-server is up.
 	srv := server.New(daemonVersion)
 	lis, err := ipc.Listen(sockPath)
 	if err != nil {
@@ -140,9 +138,7 @@ func run() error {
 		close(serveErr)
 	}()
 
-	// Forward bootstrap download progress into the Health surface. Each
-	// stage name maps to a proto Phase value; bytes flow through with
-	// matching messages so clients render percent-complete from one tuple.
+	// Forward bootstrap progress into Health via stage→Phase mapping.
 	reporter := bootstrap.StatusReporter(func(stage string, done, total int64) {
 		phase, msg := stagePhase(stage)
 		srv.SetBootstrapStatus(phase, done, total, msg)
@@ -151,13 +147,9 @@ func run() error {
 	llamaBin := os.Getenv("RUNED_LLAMA_SERVER")
 	model := os.Getenv("RUNED_MODEL")
 	if llamaBin == "" || model == "" {
-		// Pre-set status before the reporter's first tick. Manifest fetch
-		// has no dedicated Phase enum (proto omits PHASE_FETCHING_MANIFEST
-		// to avoid coupling enum churn to wire-format changes), so we
-		// leave Phase = UNSPECIFIED and convey the stage through the
-		// message field — clients that surface message render correctly
-		// without depending on enum recognition. selfBootstrap overwrites
-		// Phase once ensure{LlamaServer,Model} enters its own stage.
+		// Manifest fetch has no dedicated Phase enum; use UNSPECIFIED and
+		// convey the stage through message. selfBootstrap overwrites
+		// Phase on entering ensure{LlamaServer,Model}.
 		srv.SetBootstrapStatus(runedv1.HealthResponse_PHASE_UNSPECIFIED, 0, 0, "fetching manifest")
 		bin, mp, err := selfBootstrap(ctx, logger, paths, llamaBin == "", model == "", reporter)
 		if err != nil {
@@ -197,16 +189,14 @@ func run() error {
 	// backend.Start already bounds start-up on its own (~15s health poll +
 	// early-exit detection via the stderr scanner).
 	if err := b.Start(ctx); err != nil {
-		// b.Start may have spawned a child that failed health-probe,
-		// leaving an orphan llama-server holding ~470MB. bailBoot reaps
-		// it via b.Stop (idempotent on never-spawned backends).
+		// b.Start may have spawned a child that failed health-probe;
+		// bailBoot's b.Stop reaps it.
 		bailBoot(logger, srv, gs, b)
 		return fmt.Errorf("backend start: %w", err)
 	}
 	logger.Info("llama-server ready", "port", b.Port())
 
-	// Backend up — wire it into the server. From here on Health reports
-	// STATUS_OK and Embed/EmbedBatch accept work.
+	// Flip Health to STATUS_OK and accept Embed/EmbedBatch.
 	srv.SetBackend(b, modelID)
 
 	idleTimeout, err := parseIdleTimeout()
@@ -273,10 +263,9 @@ func run() error {
 		}
 	}
 
-	// Ensure shutdownCh is closed even when the trigger was an OS signal or
-	// a serve error — Health then advertises STATUS_SHUTTING_DOWN during
-	// the drain window. sync.Once makes a second call (after a Shutdown
-	// RPC) a no-op.
+	// Flip Health to STATUS_SHUTTING_DOWN for all exit triggers (OS
+	// signal / serve error / Shutdown RPC). sync.Once makes a redundant
+	// call a no-op.
 	srv.TriggerShutdown()
 
 	// Phase 1: drain in-flight RPCs. GracefulStop blocks until all active
@@ -305,18 +294,11 @@ func run() error {
 	return nil
 }
 
-// selfBootstrap fetches the manifest and ensures llama-server and the
-// resolved model variant are present under paths. Called whenever
-// RUNED_LLAMA_SERVER or RUNED_MODEL is unset; bypassed entirely when
-// both are provided.
-//
-// needLlama / needModel reflect which side(s) the caller still needs.
-// Only those sides are downloaded — the env-overridden side is skipped
-// so its manifest artifact isn't fetched only to be discarded. When
-// both are needed, EnsureAll's single-lock fast path is used.
-//
-// reporter is the optional status sink for download-byte progress (see
-// bootstrap.StatusReporter). Pass nil when no sink is wired.
+// selfBootstrap fetches the manifest and installs the side(s) the
+// caller needs. needLlama / needModel reflect which env paths are
+// unset; only those sides are downloaded so an env override doesn't
+// pay for an artifact it will discard. Both needed → EnsureAll's
+// single-lock fast path.
 func selfBootstrap(ctx context.Context, logger *slog.Logger, paths *bootstrap.Paths, needLlama, needModel bool, reporter bootstrap.StatusReporter) (binPath, modelPath string, err error) {
 	manifestURL := bootstrap.ResolveManifestURL()
 	if manifestURL == "" {
@@ -324,10 +306,8 @@ func selfBootstrap(ctx context.Context, logger *slog.Logger, paths *bootstrap.Pa
 			"self-bootstrap needed (RUNED_LLAMA_SERVER or RUNED_MODEL unset) but no manifest URL: set %s or rebuild with DEFAULT_MANIFEST_URL",
 			bootstrap.EnvManifest)
 	}
-	// HTTPS isn't enforced because a private network may legitimately serve
-	// the manifest over plain HTTP. But callers should know: a MITM that
-	// rewrites the manifest can also rewrite the SHA256s, so artifact
-	// integrity collapses to "trust the manifest channel."
+	// A MITM that rewrites the manifest can also rewrite the SHA256s,
+	// so artifact integrity collapses to "trust the manifest channel."
 	if !strings.HasPrefix(manifestURL, "https://") {
 		logger.Warn("manifest URL is not HTTPS; artifact integrity rests on manifest channel trust",
 			"url", manifestURL)
@@ -374,10 +354,9 @@ func selfBootstrap(ctx context.Context, logger *slog.Logger, paths *bootstrap.Pa
 	return binPath, modelPath, nil
 }
 
-// stagePhase maps a bootstrap.StatusReporter stage name to the proto
-// HealthResponse_Phase value and a short user-facing message. Returning
-// PHASE_UNSPECIFIED on unknown stages keeps the surface forward-compatible
-// with future bootstrap stages.
+// stagePhase maps a bootstrap stage name to its proto Phase + message.
+// PHASE_UNSPECIFIED on unknown stages keeps the surface forward-
+// compatible with future stages.
 func stagePhase(stage string) (runedv1.HealthResponse_Phase, string) {
 	switch stage {
 	case "llama_server":
@@ -389,13 +368,9 @@ func stagePhase(stage string) (runedv1.HealthResponse_Phase, string) {
 	}
 }
 
-// bailBoot drives the same graceful-shutdown sequence as the normal exit
-// path so an early failure during boot still flips Health to
-// STATUS_SHUTTING_DOWN, drains in-flight RPCs, and reaps the backend if
-// it managed to spawn. b may be nil when boot fails before
-// backend.NewLlamaBackend ran; b.Stop is idempotent on never-spawned
-// backends and on backends that already returned, so a non-nil b is
-// always safe to pass.
+// bailBoot runs the normal-exit cleanup sequence for boot-time failures
+// so clients see one final STATUS_SHUTTING_DOWN instead of a sudden
+// disconnect. b may be nil; b.Stop is idempotent.
 func bailBoot(logger *slog.Logger, srv *server.Server, gs *grpc.Server, b *backend.LlamaBackend) {
 	srv.TriggerShutdown()
 	stopGRPC(logger, gs)
@@ -404,11 +379,7 @@ func bailBoot(logger *slog.Logger, srv *server.Server, gs *grpc.Server, b *backe
 	}
 }
 
-// stopGRPC drives a 10s-bounded GracefulStop and falls back to Stop on
-// timeout. Used by the early-fail paths in run() (bootstrap / backend
-// startup failure) where the listener is already up but no backend has
-// been wired — in-flight RPCs are at most Health/Info, so the grace
-// window is effectively a courtesy.
+// stopGRPC drives a 10s-bounded GracefulStop with force-Stop fallback.
 func stopGRPC(logger *slog.Logger, gs *grpc.Server) {
 	graceDone := make(chan struct{})
 	go func() {
