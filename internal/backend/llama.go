@@ -115,9 +115,7 @@ func (b *LlamaBackend) EnsureStarted() error {
 	haveCmd := b.cmd != nil
 	b.mu.Unlock()
 	if haveCmd {
-		hctx, cancel := context.WithTimeout(b.daemonCtx, 500*time.Millisecond)
-		defer cancel()
-		if b.IsHealthy(hctx) {
+		if b.IsHealthy(b.daemonCtx) {
 			return nil
 		}
 		slog.Warn("backend: process alive but unhealthy, restarting")
@@ -270,6 +268,8 @@ func (b *LlamaBackend) IsHealthy(ctx context.Context) bool {
 	if port == 0 {
 		return false
 	}
+	ctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
 	url := fmt.Sprintf("http://%s:%d/health", b.cfg.Host, port)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
