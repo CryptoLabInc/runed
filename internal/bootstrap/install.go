@@ -28,6 +28,20 @@ const InstallLockTimeout = 2 * downloadTimeout
 // shows movement.
 const progressLogInterval = 2 * time.Second
 
+// maxDownloadAttempts is the cap on retries for a single artifact.
+// A ~470MB model over a flaky connection benefits from a couple of
+// retries; beyond that, the failure is most likely a manifest/server
+// mismatch (wrong SHA, missing file) where retrying just wastes time.
+const maxDownloadAttempts = 3
+
+// downloadRetryBackoff is the initial wait between attempts; it's
+// multiplied by retryBackoffMultiplier each subsequent retry so a
+// transient blip recovers quickly while a server-side cold-start has
+// time to warm up. Declared as var so tests can compress real waits.
+var downloadRetryBackoff = 5 * time.Second
+
+const retryBackoffMultiplier = 3
+
 // EnsureAll resolves the model variant and ensures both llama-server and
 // the model GGUF are present, downloading any missing pieces while
 // holding $RUNED_HOME/install.lock. Returns the absolute path to the
@@ -66,6 +80,43 @@ func EnsureAll(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger) 
 		return "", "", "", err
 	}
 	return llamaBin, modelPath, variant, nil
+}
+
+// downloadWithRetry wraps DownloadAndVerify with bounded exponential
+// backoff. Multi-hundred-MB downloads are vulnerable to transient
+// network blips that an immediate single-attempt boot would surface as
+// a hard failure to whichever supervisor (rune spawn, systemd) launched
+// runed. Caller-driven cancellation (ctx.Err) skips the retry path so
+// shutdown isn't delayed.
+func downloadWithRetry(ctx context.Context, url, sha string, size int64, dest string, progress ProgressFunc, logger *slog.Logger, stage string) error {
+	var lastErr error
+	backoff := downloadRetryBackoff
+	for attempt := 1; attempt <= maxDownloadAttempts; attempt++ {
+		if attempt > 1 {
+			logger.Warn("retrying download",
+				"stage", stage,
+				"attempt", attempt,
+				"max", maxDownloadAttempts,
+				"after", lastErr,
+				"backoff", backoff.String())
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return fmt.Errorf("download retry aborted: %w", ctx.Err())
+			}
+			backoff *= retryBackoffMultiplier
+		}
+		err := DownloadAndVerify(ctx, url, sha, size, dest, progress)
+		if err == nil {
+			return nil
+		}
+		// Caller cancelled — don't burn retries on a shutdown.
+		if ctx.Err() != nil {
+			return err
+		}
+		lastErr = err
+	}
+	return fmt.Errorf("download failed after %d attempts: %w", maxDownloadAttempts, lastErr)
 }
 
 // makeProgress returns a throttled ProgressFunc that logs at most one
@@ -149,7 +200,7 @@ func ensureLlamaServer(ctx context.Context, p *Paths, m *Manifest, logger *slog.
 			return "", fmt.Errorf("ensure llama_server: mkdir: %w", err)
 		}
 		logger.Info("ensure llama_server: downloading raw binary", "url", spec.URL)
-		if err := DownloadAndVerify(ctx, spec.URL, spec.SHA256, spec.Size, target, progress); err != nil {
+		if err := downloadWithRetry(ctx, spec.URL, spec.SHA256, spec.Size, target, progress, logger, "llama_server"); err != nil {
 			return "", fmt.Errorf("ensure llama_server: download: %w", err)
 		}
 		if err := os.Chmod(target, 0o755); err != nil {
@@ -160,7 +211,7 @@ func ensureLlamaServer(ctx context.Context, p *Paths, m *Manifest, logger *slog.
 		logger.Info("ensure llama_server: downloading tarball",
 			"url", spec.URL,
 			"cache", tarPath)
-		if err := DownloadAndVerify(ctx, spec.URL, spec.SHA256, spec.Size, tarPath, progress); err != nil {
+		if err := downloadWithRetry(ctx, spec.URL, spec.SHA256, spec.Size, tarPath, progress, logger, "llama_server"); err != nil {
 			return "", fmt.Errorf("ensure llama_server: download: %w", err)
 		}
 		defer os.Remove(tarPath)
@@ -222,7 +273,7 @@ func ensureModel(ctx context.Context, p *Paths, m *Manifest, variant string, log
 	}
 	logger.Info("ensure model: downloading GGUF", "url", spec.URL)
 	progress := makeProgress(logger, "model", spec.Size)
-	if err := DownloadAndVerify(ctx, spec.URL, spec.SHA256, spec.Size, target, progress); err != nil {
+	if err := downloadWithRetry(ctx, spec.URL, spec.SHA256, spec.Size, target, progress, logger, "model"); err != nil {
 		return "", fmt.Errorf("ensure model: download: %w", err)
 	}
 	logger.Info("ensure model: install complete", "target", target)
