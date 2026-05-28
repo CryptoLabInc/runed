@@ -164,9 +164,6 @@ func writeConfig(t *testing.T, path, body string) {
 	}
 }
 
-// EnsureLlamaServer surfaces the manifest-platform-missing error directly:
-// callers that explicitly asked for the manifest's llama-server can't be
-// rescued by env override of the model side.
 func TestEnsureLlamaServer_PlatformMissingFails(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(EnvHome, dir)
@@ -183,9 +180,8 @@ func TestEnsureLlamaServer_PlatformMissingFails(t *testing.T) {
 	}
 }
 
-// EnsureModel must not consult LlamaServerForCurrentPlatform: a caller on
-// a platform missing from the manifest who already has RUNED_LLAMA_SERVER
-// set should still be able to bootstrap a model.
+// A caller on a platform missing from the manifest can still bootstrap
+// the model side (LlamaServerForCurrentPlatform is not consulted).
 func TestEnsureModel_NoLlamaServerEntryNeeded(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(EnvHome, dir)
@@ -232,10 +228,8 @@ func TestEnsureModel_NoLlamaServerEntryNeeded(t *testing.T) {
 	}
 }
 
-// Reporter must receive an entry-stage tick from each Ensure* function so a
-// Health-surface caller can flip Phase the moment bootstrap enters that
-// stage, even when the cache-hit short-circuit (or an early error) means no
-// byte ticks follow.
+// Stage tick fires on Ensure* entry so Health flips Phase even when
+// cache hit (or early error) means no byte ticks follow.
 func TestEnsureLlamaServer_ReporterReceivesStageTickOnEntry(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(EnvHome, dir)

@@ -16,13 +16,9 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// newInProcessServer wires a Server{} to a loopback listener and returns a
-// client plus a cleanup that shuts both ends down. It deliberately uses a
-// random port (":0") so multiple tests can run in parallel without port clash.
-//
-// b == nil leaves the server in its pre-SetBackend state (Health returns
-// STATUS_LOADING; Embed/EmbedBatch return FAILED_PRECONDITION). Non-nil b
-// is wired via SetBackend with a synthetic model identity.
+// newInProcessServer wires a Server to a loopback listener. b == nil
+// leaves the server pre-SetBackend (Health = LOADING, Embed =
+// FAILED_PRECONDITION); non-nil b is wired with a synthetic model id.
 func newInProcessServer(t *testing.T, b *backend.LlamaBackend) (runedv1.RunedServiceClient, func()) {
 	t.Helper()
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -198,8 +194,6 @@ func TestServer_HealthBootstrapFieldsDefaultZero(t *testing.T) {
 	}
 }
 
-// Without a backend wired, Health reports STATUS_LOADING. Phase/bytes are
-// zero until SetBootstrapStatus is called.
 func TestServer_HealthLoadingBeforeSetBackend(t *testing.T) {
 	client, cleanup := newInProcessServer(t, nil)
 	defer cleanup()
@@ -213,8 +207,6 @@ func TestServer_HealthLoadingBeforeSetBackend(t *testing.T) {
 	}
 }
 
-// After SetBootstrapStatus, Health reflects the recorded phase, bytes, and
-// message verbatim — the proto fields are wired directly from the snapshot.
 func TestServer_HealthLoadingReflectsSetBootstrapStatus(t *testing.T) {
 	s := New("vtest")
 	s.SetBootstrapStatus(
@@ -239,10 +231,8 @@ func TestServer_HealthLoadingReflectsSetBootstrapStatus(t *testing.T) {
 	}
 }
 
-// Embed before SetBackend must surface FAILED_PRECONDITION (not Unavailable
-// or generic Internal) so clients can branch on the code and switch to
-// Health-polling instead of consuming retry budget against a daemon that
-// can't yet answer.
+// FAILED_PRECONDITION (not Unavailable) so client retry policies don't
+// consume budget against a non-ready daemon.
 func TestServer_EmbedFailsBeforeBackendSet(t *testing.T) {
 	s := New("vtest")
 	_, err := s.Embed(context.Background(), &runedv1.EmbedRequest{Text: "x"})
@@ -265,10 +255,6 @@ func TestServer_EmbedBatchFailsBeforeBackendSet(t *testing.T) {
 	}
 }
 
-// After TriggerShutdown (or a Shutdown RPC), Health flips to
-// STATUS_SHUTTING_DOWN regardless of backend state — the drain-in-progress
-// signal outranks LOADING/DEGRADED/OK so callers don't send fresh work
-// just to receive Unavailable mid-drain.
 func TestServer_HealthShuttingDownAfterTrigger(t *testing.T) {
 	s := New("vtest")
 	s.TriggerShutdown()
@@ -282,10 +268,8 @@ func TestServer_HealthShuttingDownAfterTrigger(t *testing.T) {
 	}
 }
 
-// SHUTTING_DOWN must outrank LOADING — pinning this priority guards
-// against future Health refactors accidentally reordering the checks and
-// surfacing LOADING to clients during a drain (which would lead them to
-// keep polling instead of disconnecting).
+// Pins SHUTTING_DOWN > LOADING priority so future Health refactors
+// don't surface LOADING during drain.
 func TestServer_HealthShuttingDownOutranksLoading(t *testing.T) {
 	s := New("vtest")
 	// backend nil → LOADING candidate; bootstrap status would normally
