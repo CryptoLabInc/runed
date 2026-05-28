@@ -4,6 +4,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -137,6 +138,14 @@ func shortMethod(fullMethod string) string {
 	return fullMethod
 }
 
+// embedMaxAttempts bounds the EnsureStarted/Embed retry loop in
+// Embed/EmbedBatch. One retry covers the residual race where Stop slips
+// in between EnsureStarted returning and the Embed RLock — the second
+// EnsureStarted re-spawns llama-server and the second Embed proceeds
+// under a fresh RLock. Bounded at 2 so a genuinely broken backend can't
+// loop forever.
+const embedMaxAttempts = 2
+
 // Embed delegates to the backend's single-text embedding path.
 // The proto dropped the normalize field (see commit 816ef81); the backend is
 // called with normalize=true as a harmless default since llama-server always
@@ -147,37 +156,53 @@ func shortMethod(fullMethod string) string {
 // suspend pays the llama-server cold-start latency (~hundreds of ms to a few
 // seconds for model load); subsequent requests fall through the cheap health-
 // probe fast path.
+//
+// Retry loop: backend.Embed holds inflightMu.RLock so Stop can't kill an
+// in-flight HTTP. The remaining race window is EnsureStarted-return →
+// RLock-acquire; if Stop slips into that gap we get ErrNotStarted on the
+// first attempt and recover by re-running EnsureStarted once.
 func (s *Server) Embed(ctx context.Context, req *runedv1.EmbedRequest) (*runedv1.EmbedResponse, error) {
 	s.requests.Add(1)
-	if err := s.backend.EnsureStarted(); err != nil {
-		return nil, fmt.Errorf("backend not ready: %w", err)
+	for attempt := 0; attempt < embedMaxAttempts; attempt++ {
+		if err := s.backend.EnsureStarted(); err != nil {
+			return nil, fmt.Errorf("backend not ready: %w", err)
+		}
+		vec, err := s.backend.Embed(ctx, req.Text, true)
+		if err == nil {
+			return &runedv1.EmbedResponse{Vector: vec}, nil
+		}
+		if !errors.Is(err, backend.ErrNotStarted) {
+			return nil, err
+		}
 	}
-	vec, err := s.backend.Embed(ctx, req.Text, true)
-	if err != nil {
-		return nil, err
-	}
-	return &runedv1.EmbedResponse{Vector: vec}, nil
+	return nil, fmt.Errorf("backend kept suspending between EnsureStarted and Embed")
 }
 
 // EmbedBatch delegates to the backend's batch path and wraps each vector in
 // an EmbedResponse so the proto response message stays composable with
-// single-text Embed. See Embed godoc on EnsureStarted / cold-start behaviour.
+// single-text Embed. See Embed godoc on EnsureStarted / cold-start behaviour
+// and on the ErrNotStarted retry loop.
 func (s *Server) EmbedBatch(ctx context.Context, req *runedv1.EmbedBatchRequest) (*runedv1.EmbedBatchResponse, error) {
 	s.requests.Add(1)
-	if err := s.backend.EnsureStarted(); err != nil {
-		return nil, fmt.Errorf("backend not ready: %w", err)
+	for attempt := 0; attempt < embedMaxAttempts; attempt++ {
+		if err := s.backend.EnsureStarted(); err != nil {
+			return nil, fmt.Errorf("backend not ready: %w", err)
+		}
+		vecs, err := s.backend.EmbedBatch(ctx, req.Texts, true)
+		if err == nil {
+			out := &runedv1.EmbedBatchResponse{
+				Embeddings: make([]*runedv1.EmbedResponse, len(vecs)),
+			}
+			for i, v := range vecs {
+				out.Embeddings[i] = &runedv1.EmbedResponse{Vector: v}
+			}
+			return out, nil
+		}
+		if !errors.Is(err, backend.ErrNotStarted) {
+			return nil, err
+		}
 	}
-	vecs, err := s.backend.EmbedBatch(ctx, req.Texts, true)
-	if err != nil {
-		return nil, err
-	}
-	out := &runedv1.EmbedBatchResponse{
-		Embeddings: make([]*runedv1.EmbedResponse, len(vecs)),
-	}
-	for i, v := range vecs {
-		out.Embeddings[i] = &runedv1.EmbedResponse{Vector: v}
-	}
-	return out, nil
+	return nil, fmt.Errorf("backend kept suspending between EnsureStarted and EmbedBatch")
 }
 
 // Info returns static daemon metadata. Does not touch the backend — safe to

@@ -4,12 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 )
 
 const maxErrorBodyBytes = 4 << 10 // 4 KiB cap for reading an error body
+
+// ErrNotStarted is returned when Embed/EmbedBatch is invoked but the
+// backend has no live llama-server (port == 0). Callers can recover by
+// invoking EnsureStarted and retrying: the typical trigger is the idle
+// ticker stopping the child between an earlier EnsureStarted check and
+// the Embed call that follows.
+var ErrNotStarted = errors.New("backend not started")
 
 // embedReq is the request shape for llama-server's /v1/embeddings endpoint.
 // The endpoint is OpenAI-compatible.
@@ -37,7 +45,7 @@ type embedResp struct {
 func (b *LlamaBackend) doJSON(ctx context.Context, path string, in any, out any) error {
 	port := b.Port()
 	if port == 0 {
-		return fmt.Errorf("backend not started")
+		return ErrNotStarted
 	}
 	url := fmt.Sprintf("http://%s:%d%s", b.cfg.Host, port, path)
 
@@ -81,6 +89,8 @@ func (b *LlamaBackend) doJSON(ctx context.Context, path string, in any, out any)
 // future flexibility (e.g., if llama.cpp exposes an un-normalize flag later).
 func (b *LlamaBackend) Embed(ctx context.Context, text string, normalize bool) ([]float32, error) {
 	_ = normalize // currently ignored; see godoc above
+	b.inflightMu.RLock()
+	defer b.inflightMu.RUnlock()
 	var out embedResp
 	if err := b.doJSON(ctx, "/v1/embeddings", embedReq{Input: text}, &out); err != nil {
 		return nil, err
@@ -102,6 +112,8 @@ func (b *LlamaBackend) EmbedBatch(ctx context.Context, texts []string, normalize
 	if len(texts) == 0 {
 		return nil, nil
 	}
+	b.inflightMu.RLock()
+	defer b.inflightMu.RUnlock()
 	var out embedResp
 	if err := b.doJSON(ctx, "/v1/embeddings", embedReq{Input: texts}, &out); err != nil {
 		return nil, err

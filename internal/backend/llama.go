@@ -38,6 +38,12 @@ type LlamaBackend struct {
 	// call EnsureStarted on every request so the contention here must
 	// stay cheap (a healthy fast-path returns in ~ms).
 	lifecycleMu sync.Mutex
+	// inflightMu pairs Embed/EmbedBatch (readers) with Stop (writer).
+	// Without it, the idle ticker can SIGTERM llama-server while an
+	// Embed HTTP call is in flight — the call would die with a
+	// connection reset. Stop takes the writer Lock so it waits for
+	// every in-flight Embed to finish before signalling the child.
+	inflightMu sync.RWMutex
 	// daemonCtx is the long-lived context recorded on the first Start.
 	// EnsureStarted re-spawns the child under this ctx instead of a
 	// short-lived RPC context, so the resurrected llama-server outlives
@@ -280,7 +286,15 @@ func (b *LlamaBackend) IsHealthy(ctx context.Context) bool {
 // Stop terminates the llama-server child if running. After Stop returns,
 // cmd is nil and port is 0 — a subsequent EnsureStarted re-launches the
 // child cleanly.
+//
+// inflightMu's writer Lock is taken first so Stop blocks until every
+// in-flight Embed/EmbedBatch HTTP call finishes; otherwise the idle
+// ticker could SIGTERM llama-server mid-request and the client would
+// see a connection reset. Lock order is inflightMu → lifecycleMu — the
+// reverse never appears in any code path, so no deadlock.
 func (b *LlamaBackend) Stop(ctx context.Context) error {
+	b.inflightMu.Lock()
+	defer b.inflightMu.Unlock()
 	b.lifecycleMu.Lock()
 	defer b.lifecycleMu.Unlock()
 	return b.stopLocked(ctx)
