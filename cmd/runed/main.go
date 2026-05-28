@@ -97,7 +97,7 @@ func run() error {
 	llamaBin := os.Getenv("RUNED_LLAMA_SERVER")
 	model := os.Getenv("RUNED_MODEL")
 	if llamaBin == "" || model == "" {
-		bin, mp, err := selfBootstrap(ctx, logger, paths)
+		bin, mp, err := selfBootstrap(ctx, logger, paths, llamaBin == "", model == "")
 		if err != nil {
 			return err
 		}
@@ -250,7 +250,12 @@ func run() error {
 // resolved model variant are present under paths. Called whenever
 // RUNED_LLAMA_SERVER or RUNED_MODEL is unset; bypassed entirely when
 // both are provided.
-func selfBootstrap(ctx context.Context, logger *slog.Logger, paths *bootstrap.Paths) (binPath, modelPath string, err error) {
+//
+// needLlama / needModel reflect which side(s) the caller still needs.
+// Only those sides are downloaded — the env-overridden side is skipped
+// so its manifest artifact isn't fetched only to be discarded. When
+// both are needed, EnsureAll's single-lock fast path is used.
+func selfBootstrap(ctx context.Context, logger *slog.Logger, paths *bootstrap.Paths, needLlama, needModel bool) (binPath, modelPath string, err error) {
 	manifestURL := bootstrap.ResolveManifestURL()
 	if manifestURL == "" {
 		return "", "", fmt.Errorf(
@@ -274,14 +279,36 @@ func selfBootstrap(ctx context.Context, logger *slog.Logger, paths *bootstrap.Pa
 		"platforms", len(mani.Platforms),
 		"models", len(mani.Models),
 		"default_model", mani.DefaultModel)
-	binPath, modelPath, variant, err := bootstrap.EnsureAll(ctx, paths, mani, logger)
-	if err != nil {
-		return "", "", fmt.Errorf("bootstrap install: %w", err)
+	switch {
+	case needLlama && needModel:
+		var variant string
+		binPath, modelPath, variant, err = bootstrap.EnsureAll(ctx, paths, mani, logger)
+		if err != nil {
+			return "", "", fmt.Errorf("bootstrap install: %w", err)
+		}
+		logger.Info("self-bootstrap ready",
+			"llama_server", binPath,
+			"model", modelPath,
+			"variant", variant)
+	case needLlama:
+		binPath, err = bootstrap.EnsureLlamaServer(ctx, paths, mani, logger)
+		if err != nil {
+			return "", "", fmt.Errorf("bootstrap install: %w", err)
+		}
+		logger.Info("self-bootstrap ready (llama-server only; model from env)",
+			"llama_server", binPath)
+	case needModel:
+		var variant string
+		modelPath, variant, err = bootstrap.EnsureModel(ctx, paths, mani, logger)
+		if err != nil {
+			return "", "", fmt.Errorf("bootstrap install: %w", err)
+		}
+		logger.Info("self-bootstrap ready (model only; llama-server from env)",
+			"model", modelPath,
+			"variant", variant)
+	default:
+		return "", "", fmt.Errorf("selfBootstrap called with nothing to do")
 	}
-	logger.Info("self-bootstrap ready",
-		"llama_server", binPath,
-		"model", modelPath,
-		"variant", variant)
 	return binPath, modelPath, nil
 }
 

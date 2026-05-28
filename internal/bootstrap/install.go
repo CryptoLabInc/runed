@@ -47,6 +47,12 @@ const retryBackoffMultiplier = 3
 // holding $RUNED_HOME/install.lock. Returns the absolute path to the
 // llama-server executable and the GGUF file the daemon should load.
 //
+// This is the normal-path entry point: both RUNED_LLAMA_SERVER and
+// RUNED_MODEL unset → manifest-driven install of everything. When only
+// one env var is set, callers should use EnsureLlamaServer or
+// EnsureModel directly so the side they already have isn't redownloaded
+// only to be discarded by the env override.
+//
 // logger may be nil; slog.Default() is used in that case. All progress
 // and per-step status is emitted through this logger — callers don't
 // need to thread a separate ProgressFunc.
@@ -80,6 +86,66 @@ func EnsureAll(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger) 
 		return "", "", "", err
 	}
 	return llamaBin, modelPath, variant, nil
+}
+
+// EnsureLlamaServer ensures only the llama-server binary is present and
+// returns its absolute path. Use when the caller already has a model
+// path (e.g. RUNED_MODEL is set) and only the llama-server side needs
+// the manifest install.
+//
+// The manifest must include an entry for the current platform —
+// LlamaServerForCurrentPlatform is consulted unconditionally here, which
+// is fine because the caller explicitly asked for the manifest's
+// llama-server.
+func EnsureLlamaServer(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger) (string, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if err := p.EnsureDirs(); err != nil {
+		return "", err
+	}
+	lock, err := AcquireLock(p.InstallLock, InstallLockTimeout)
+	if err != nil {
+		return "", fmt.Errorf("install lock: %w", err)
+	}
+	defer lock.Release()
+	return ensureLlamaServer(ctx, p, m, logger)
+}
+
+// EnsureModel ensures only the model GGUF is present and returns the
+// absolute path plus the resolved variant ID. Use when the caller
+// already has a llama-server path (e.g. RUNED_LLAMA_SERVER is set) and
+// only the model side needs the manifest install.
+//
+// LlamaServerForCurrentPlatform is not called here, so a caller on a
+// platform missing from the manifest can still bootstrap a model as
+// long as their RUNED_LLAMA_SERVER points at a working binary.
+func EnsureModel(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger) (modelPath, variant string, err error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if err := p.EnsureDirs(); err != nil {
+		return "", "", err
+	}
+	variant, err = ResolveModelVariant(p, m)
+	if err != nil {
+		return "", "", err
+	}
+	logger.Info("ensure: resolved model variant",
+		"variant", variant,
+		"default_model", m.DefaultModel)
+
+	lock, err := AcquireLock(p.InstallLock, InstallLockTimeout)
+	if err != nil {
+		return "", "", fmt.Errorf("install lock: %w", err)
+	}
+	defer lock.Release()
+
+	modelPath, err = ensureModel(ctx, p, m, variant, logger)
+	if err != nil {
+		return "", "", err
+	}
+	return modelPath, variant, nil
 }
 
 // downloadWithRetry wraps DownloadAndVerify with bounded exponential

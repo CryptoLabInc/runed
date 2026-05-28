@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -160,5 +161,73 @@ func writeConfig(t *testing.T, path, body string) {
 	}
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
+	}
+}
+
+// EnsureLlamaServer surfaces the manifest-platform-missing error directly:
+// callers that explicitly asked for the manifest's llama-server can't be
+// rescued by env override of the model side.
+func TestEnsureLlamaServer_PlatformMissingFails(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(EnvHome, dir)
+	p, _ := Resolve()
+
+	m := &Manifest{
+		Version:   1,
+		Platforms: map[string]PlatformArtifacts{},
+		Models:    map[string]ArtifactSpec{},
+	}
+
+	if _, err := EnsureLlamaServer(t.Context(), p, m, slog.Default()); !errors.Is(err, ErrNoArtifactForPlatform) {
+		t.Fatalf("expected ErrNoArtifactForPlatform, got: %v", err)
+	}
+}
+
+// EnsureModel must not consult LlamaServerForCurrentPlatform: a caller on
+// a platform missing from the manifest who already has RUNED_LLAMA_SERVER
+// set should still be able to bootstrap a model.
+func TestEnsureModel_NoLlamaServerEntryNeeded(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(EnvHome, dir)
+	t.Setenv(EnvModelVariant, "")
+	p, _ := Resolve()
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatalf("EnsureDirs: %v", err)
+	}
+
+	// Pre-populate the model file so the cache-hit path returns without
+	// touching the network — what we're testing is the platform-check path,
+	// not the download path.
+	variant := "test-variant"
+	body := []byte("model-content")
+	sum := sha256.Sum256(body)
+	wantSHA := hex.EncodeToString(sum[:])
+
+	modelPath := p.ModelPath(variant)
+	if err := os.MkdirAll(filepath.Dir(modelPath), 0o700); err != nil {
+		t.Fatalf("mkdir models: %v", err)
+	}
+	if err := os.WriteFile(modelPath, body, 0o600); err != nil {
+		t.Fatalf("write model: %v", err)
+	}
+
+	m := &Manifest{
+		Version:   1,
+		Platforms: map[string]PlatformArtifacts{}, // intentionally empty
+		Models: map[string]ArtifactSpec{
+			variant: {URL: "https://ignored", SHA256: wantSHA, Size: int64(len(body))},
+		},
+		DefaultModel: variant,
+	}
+
+	got, gotVariant, err := EnsureModel(t.Context(), p, m, slog.Default())
+	if err != nil {
+		t.Fatalf("EnsureModel must succeed when no llama-server entry is present: %v", err)
+	}
+	if got != modelPath {
+		t.Errorf("got path %q, want %q", got, modelPath)
+	}
+	if gotVariant != variant {
+		t.Errorf("got variant %q, want %q", gotVariant, variant)
 	}
 }
