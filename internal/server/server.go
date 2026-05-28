@@ -4,6 +4,10 @@ package server
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -93,43 +97,112 @@ func (s *Server) TriggerShutdown() {
 // All RPCs count — including Health and Info — so a monitoring tool that
 // polls Health intentionally keeps the daemon alive. This is the
 // "all RPCs as activity" decision from the Plan B design doc §5.
+//
+// Embed-class RPCs additionally emit start/done log lines (with duration
+// and error if any). Control-plane RPCs (Health/Info/Shutdown) stay
+// silent here to avoid drowning the daemon log under monitor polling.
 func (s *Server) UnaryActivityInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req interface{},
 		info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		s.lastActivity.Store(time.Now().UnixNano())
-		return handler(ctx, req)
+		if !isEmbedMethod(info.FullMethod) {
+			return handler(ctx, req)
+		}
+		method := shortMethod(info.FullMethod)
+		slog.Info("rpc start", "method", method)
+		start := time.Now()
+		resp, err := handler(ctx, req)
+		attrs := []any{"method", method, "duration_ms", time.Since(start).Milliseconds()}
+		if err != nil {
+			attrs = append(attrs, "err", err.Error())
+		}
+		slog.Info("rpc done", attrs...)
+		return resp, err
 	}
 }
+
+// isEmbedMethod returns true for Embed and EmbedBatch full-method paths.
+// Used by UnaryActivityInterceptor to scope per-RPC logging.
+func isEmbedMethod(fullMethod string) bool {
+	return strings.HasSuffix(fullMethod, "/Embed") ||
+		strings.HasSuffix(fullMethod, "/EmbedBatch")
+}
+
+// shortMethod returns the trailing segment of a gRPC full-method path
+// (e.g. "/runed.v1.RunedService/Embed" → "Embed"). Used for compact log
+// labels.
+func shortMethod(fullMethod string) string {
+	if i := strings.LastIndex(fullMethod, "/"); i >= 0 {
+		return fullMethod[i+1:]
+	}
+	return fullMethod
+}
+
+// embedMaxAttempts bounds the EnsureStarted/Embed retry loop in
+// Embed/EmbedBatch. One retry covers the residual race where Stop slips
+// in between EnsureStarted returning and the Embed RLock — the second
+// EnsureStarted re-spawns llama-server and the second Embed proceeds
+// under a fresh RLock. Bounded at 2 so a genuinely broken backend can't
+// loop forever.
+const embedMaxAttempts = 2
 
 // Embed delegates to the backend's single-text embedding path.
 // The proto dropped the normalize field (see commit 816ef81); the backend is
 // called with normalize=true as a harmless default since llama-server always
 // returns L2-normalized vectors anyway.
+//
+// Backend may be suspended (idle-suspend) when this RPC arrives. EnsureStarted
+// resurrects it under the daemon-lifetime context — the first request after a
+// suspend pays the llama-server cold-start latency (~hundreds of ms to a few
+// seconds for model load); subsequent requests fall through the cheap health-
+// probe fast path.
+//
+// Retry loop: backend.Embed holds inflightMu.RLock so Stop can't kill an
+// in-flight HTTP. The remaining race window is EnsureStarted-return →
+// RLock-acquire; if Stop slips into that gap we get ErrNotStarted on the
+// first attempt and recover by re-running EnsureStarted once.
 func (s *Server) Embed(ctx context.Context, req *runedv1.EmbedRequest) (*runedv1.EmbedResponse, error) {
 	s.requests.Add(1)
-	vec, err := s.backend.Embed(ctx, req.Text, true)
-	if err != nil {
-		return nil, err
+	for attempt := 0; attempt < embedMaxAttempts; attempt++ {
+		if err := s.backend.EnsureStarted(); err != nil {
+			return nil, fmt.Errorf("backend not ready: %w", err)
+		}
+		vec, err := s.backend.Embed(ctx, req.Text, true)
+		if err == nil {
+			return &runedv1.EmbedResponse{Vector: vec}, nil
+		}
+		if !errors.Is(err, backend.ErrNotStarted) {
+			return nil, err
+		}
 	}
-	return &runedv1.EmbedResponse{Vector: vec}, nil
+	return nil, fmt.Errorf("backend kept suspending between EnsureStarted and Embed")
 }
 
 // EmbedBatch delegates to the backend's batch path and wraps each vector in
 // an EmbedResponse so the proto response message stays composable with
-// single-text Embed.
+// single-text Embed. See Embed godoc on EnsureStarted / cold-start behaviour
+// and on the ErrNotStarted retry loop.
 func (s *Server) EmbedBatch(ctx context.Context, req *runedv1.EmbedBatchRequest) (*runedv1.EmbedBatchResponse, error) {
 	s.requests.Add(1)
-	vecs, err := s.backend.EmbedBatch(ctx, req.Texts, true)
-	if err != nil {
-		return nil, err
+	for attempt := 0; attempt < embedMaxAttempts; attempt++ {
+		if err := s.backend.EnsureStarted(); err != nil {
+			return nil, fmt.Errorf("backend not ready: %w", err)
+		}
+		vecs, err := s.backend.EmbedBatch(ctx, req.Texts, true)
+		if err == nil {
+			out := &runedv1.EmbedBatchResponse{
+				Embeddings: make([]*runedv1.EmbedResponse, len(vecs)),
+			}
+			for i, v := range vecs {
+				out.Embeddings[i] = &runedv1.EmbedResponse{Vector: v}
+			}
+			return out, nil
+		}
+		if !errors.Is(err, backend.ErrNotStarted) {
+			return nil, err
+		}
 	}
-	out := &runedv1.EmbedBatchResponse{
-		Embeddings: make([]*runedv1.EmbedResponse, len(vecs)),
-	}
-	for i, v := range vecs {
-		out.Embeddings[i] = &runedv1.EmbedResponse{Vector: v}
-	}
-	return out, nil
+	return nil, fmt.Errorf("backend kept suspending between EnsureStarted and EmbedBatch")
 }
 
 // Info returns static daemon metadata. Does not touch the backend — safe to

@@ -49,9 +49,12 @@ Direct foreground launch is supported for development and debugging:
 ./bin/runed
 ```
 
-The daemon exits gracefully after `RUNED_IDLE_TIMEOUT` (default 10m)
-with no activity, draining in-flight RPCs and terminating the
-`llama-server` child before unlinking the socket.
+After `RUNED_IDLE_TIMEOUT` (default 10m) of no RPC activity, the daemon
+stops its `llama-server` child to release the ~470MB+ of model weights
+from memory — but `runed` itself stays up with the gRPC socket still
+listening. The next `Embed`/`EmbedBatch` RPC transparently restarts the
+backend (cold-start latency paid only on that single request). The
+daemon process exits only on SIGINT/SIGTERM/SIGHUP or a Shutdown RPC.
 
 ## Configuration
 
@@ -65,7 +68,7 @@ with no activity, draining in-flight RPCs and terminating the
 | `RUNED_MODEL`         | Skip self-bootstrap; use this GGUF                          | (unset) |
 | `RUNED_MODEL_VARIANT` | Pick a non-default model from `manifest.models`             | `manifest.default_model` |
 | `RUNED_CTX_SIZE`      | `llama-server --ctx-size` (max input length in tokens)      | 2048 |
-| `RUNED_IDLE_TIMEOUT`  | Auto-shutdown after this much idle. `"0"` disables          | 10m |
+| `RUNED_IDLE_TIMEOUT`  | After this much idle, stop the llama-server child to free model memory. `runed` itself stays up; the next Embed RPC resurrects the backend. `"0"` disables suspend | 10m |
 
 `RUNED_MANIFEST` should be **HTTPS** in production. HTTP is permitted
 (for private networks) but emits a warning at startup — a MITM that
