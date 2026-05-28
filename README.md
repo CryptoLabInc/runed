@@ -72,22 +72,9 @@ with no activity, draining in-flight RPCs and terminating the
 rewrites the manifest can also rewrite the per-artifact SHA256s, so
 artifact integrity collapses to "trust the manifest channel" alone.
 
-### Build-time options
-
-Release / dev builds inject default URLs via `-ldflags` so end users
-never need to discover environment variables:
-
-```
-make build \
-    DEFAULT_MANIFEST_URL=https://your.host/runed-manifest.json \
-    DEFAULT_RUNED_BINARY=$HOME/.runed/bin/runed
-```
-
-- `DEFAULT_MANIFEST_URL` → `internal/bootstrap.DefaultManifestURL`,
-  consumed by the daemon's self-bootstrap when `RUNED_MANIFEST` is unset.
-- `DEFAULT_RUNED_BINARY` → `internal/spawn.DefaultRunedBinary`,
-  consumed by clients (e.g. `rune-mcp`, `rundemo`) when they need to
-  auto-spawn the daemon and neither config nor PATH resolves a binary.
+The `DefaultManifestURL` referenced in the table above is injected at
+build time via `-ldflags`; see [`CONTRIBUTING.md`](CONTRIBUTING.md#build-time-options)
+for the relevant `make build` flags.
 
 ### Manifest format
 

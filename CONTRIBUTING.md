@@ -17,6 +17,23 @@ make proto         # generate Go stubs from proto/ into gen/
 make build         # produce bin/runed and bin/rundemo
 ```
 
+### Build-time options
+
+Release / dev builds inject default URLs via `-ldflags` so end users
+never need to discover environment variables:
+
+```bash
+make build \
+    DEFAULT_MANIFEST_URL=https://your.host/runed-manifest.json \
+    DEFAULT_RUNED_BINARY=$HOME/.runed/bin/runed
+```
+
+- `DEFAULT_MANIFEST_URL` → `internal/bootstrap.DefaultManifestURL`,
+  consumed by the daemon's self-bootstrap when `RUNED_MANIFEST` is unset.
+- `DEFAULT_RUNED_BINARY` → `internal/spawn.DefaultRunedBinary`,
+  consumed by clients (e.g. `rune-mcp`, `rundemo`) when they need to
+  auto-spawn the daemon and neither config nor PATH resolves a binary.
+
 ## Testing
 
 ```bash
