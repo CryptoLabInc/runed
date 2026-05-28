@@ -48,6 +48,14 @@ func DownloadAndVerify(ctx context.Context, url, expectedSHA256 string, expected
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download: GET %s: HTTP %d", url, resp.StatusCode)
 	}
+	// Fail fast on Content-Length mismatch — saves ~470MB of wasted I/O when
+	// the manifest and server disagree. ContentLength == -1 means the server
+	// didn't advertise a length (chunked transfer); the post-stream check at
+	// the bottom of this function is the safety net for that case.
+	if expectedSize > 0 && resp.ContentLength > 0 && resp.ContentLength != expectedSize {
+		return fmt.Errorf("download: Content-Length mismatch: server claims %d bytes, manifest claims %d",
+			resp.ContentLength, expectedSize)
+	}
 
 	partial := destPath + ".partial"
 	f, err := os.OpenFile(partial, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
