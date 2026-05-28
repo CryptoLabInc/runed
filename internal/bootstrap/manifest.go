@@ -1,7 +1,6 @@
 package bootstrap
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -137,7 +136,10 @@ func fetchManifestFrom(ctx context.Context, url string) (*Manifest, error) {
 
 func parseManifest(body []byte) (*Manifest, error) {
 	var m Manifest
-	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&m); err != nil {
+	// Unmarshal (not Decoder.Decode) so trailing bytes after the JSON
+	// document are rejected — useful corruption / MITM signal for a
+	// channel where the body should be exactly one manifest.
+	if err := json.Unmarshal(body, &m); err != nil {
 		return nil, fmt.Errorf("manifest: parse JSON: %w", err)
 	}
 	if m.Version != ManifestVersion {

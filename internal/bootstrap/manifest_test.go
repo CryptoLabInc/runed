@@ -69,6 +69,13 @@ func TestParseManifest_VersionMismatch(t *testing.T) {
 	}
 }
 
+func TestParseManifest_RejectsTrailingData(t *testing.T) {
+	body := []byte(sampleManifest + `<garbage>`)
+	if _, err := parseManifest(body); err == nil {
+		t.Error("expected parse error for trailing data, got nil")
+	}
+}
+
 func TestModelSpec(t *testing.T) {
 	m, _ := parseManifest([]byte(sampleManifest))
 	spec, err := m.ModelSpec("qwen3-embedding-0.6b.q6_K")
