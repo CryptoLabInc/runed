@@ -11,10 +11,16 @@ import (
 )
 
 // InstallLockTimeout bounds how long a concurrent boot will wait for the
-// install.lock holder. Self-bootstrap can take minutes on slow networks
-// (the model alone is ~470MB at q6_K); 10m gives the leader enough room
-// without leaving the trailer wedged forever.
-const InstallLockTimeout = 10 * time.Minute
+// install.lock holder. The leader can run ensureLlamaServer (bounded by
+// downloadTimeout) followed by ensureModel (bounded by downloadTimeout
+// again), so the worst-case legitimate hold is 2*downloadTimeout. A
+// shorter timeout would fail trailers during slow-but-healthy installs
+// even though the leader is making progress.
+//
+// The "wedged forever" guarantee still holds: downloadTimeout caps any
+// single artifact transfer on the leader side, so a longer lock timeout
+// doesn't reintroduce zombie risk.
+const InstallLockTimeout = 2 * downloadTimeout
 
 // progressLogInterval is the minimum gap between progress log lines for
 // a single download. Tuned high enough that a tiny manifest fetch only
