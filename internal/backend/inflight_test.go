@@ -37,12 +37,8 @@ func TestStopWaitsForInflightEmbed(t *testing.T) {
 	host, port := splitHostPort(t, fake.URL)
 	b := NewLlamaBackend(Config{Host: host})
 
-	cmd := startPlaceholderChild(t)
+	cmd := attachPlaceholderChild(t, b, port)
 	defer cleanupPlaceholderChild(cmd)
-	b.mu.Lock()
-	b.port = port
-	b.cmd = cmd
-	b.mu.Unlock()
 
 	embedDone := make(chan error, 1)
 	go func() {
@@ -96,12 +92,8 @@ func TestStopWaitsForInflightEmbed(t *testing.T) {
 func TestEmbedReturnsErrNotStartedAfterStop(t *testing.T) {
 	b := NewLlamaBackend(Config{})
 
-	cmd := startPlaceholderChild(t)
+	cmd := attachPlaceholderChild(t, b, 1)
 	defer cleanupPlaceholderChild(cmd)
-	b.mu.Lock()
-	b.port = 1
-	b.cmd = cmd
-	b.mu.Unlock()
 
 	if err := b.Stop(context.Background()); err != nil {
 		t.Fatalf("Stop: %v", err)
@@ -135,20 +127,31 @@ func splitHostPort(t *testing.T, raw string) (string, int) {
 	return host, port
 }
 
-// startPlaceholderChild spawns a long-running `sleep` so Stop has a real
-// Process to SIGTERM — exercises the lock path without needing llama-server.
-func startPlaceholderChild(t *testing.T) *exec.Cmd {
+// attachPlaceholderChild spawns a long-running `sleep` as a stand-in for
+// llama-server, wires it into b along with the watcher goroutine, and
+// returns the cmd so callers can defer cleanup. This mirrors what
+// startLocked does on the happy path — needed because Stop now waits on
+// the watcher's done channel instead of calling cmd.Wait itself.
+func attachPlaceholderChild(t *testing.T, b *LlamaBackend, port int) *exec.Cmd {
 	t.Helper()
 	cmd := exec.Command("sleep", "60")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("spawn placeholder: %v", err)
 	}
+	done := make(chan struct{})
+	b.mu.Lock()
+	b.cmd = cmd
+	b.port = port
+	b.cmdDone = done
+	b.mu.Unlock()
+	go b.watchChild(cmd, done)
 	return cmd
 }
 
+// cleanupPlaceholderChild is best-effort: if the watcher already reaped the
+// child (e.g. because the test called Stop), Kill/Wait return harmless errors.
 func cleanupPlaceholderChild(cmd *exec.Cmd) {
 	if cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
 	}
 }

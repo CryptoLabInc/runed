@@ -30,9 +30,11 @@ type Config struct {
 type LlamaBackend struct {
 	cfg Config
 
-	cmd  *exec.Cmd
-	port int
-	mu   sync.Mutex // protects cmd, port — short critical sections only
+	cmd      *exec.Cmd
+	port     int
+	cmdDone  chan struct{} // closed by watchChild when current cmd.Wait returns
+	stopping bool          // true while stopLocked is intentionally terminating the child
+	mu       sync.Mutex    // protects cmd, port, cmdDone, stopping — short critical sections only
 
 	// lifecycleMu serializes Start / Stop / EnsureStarted. RPC handlers
 	// call EnsureStarted on every request so the contention here must
@@ -156,10 +158,16 @@ func (b *LlamaBackend) startLocked(ctx context.Context) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start: %w", err)
 	}
+	// Watcher owns cmd.Wait — exactly one caller, no zombies, and unexpected
+	// exits get logged + state cleared so EnsureStarted re-spawns cleanly
+	// instead of carrying a stale b.cmd pointing at a dead PID.
+	done := make(chan struct{})
 	b.mu.Lock()
 	b.cmd = cmd
 	b.port = 0
+	b.cmdDone = done
 	b.mu.Unlock()
+	go b.watchChild(cmd, done)
 
 	var logW io.Writer = io.Discard
 	var logFile *os.File
@@ -205,23 +213,18 @@ func (b *LlamaBackend) startLocked(ctx context.Context) error {
 		}
 	}()
 
-	// Wait for port + health
+	// Wait for port + health. The watcher (not us) calls cmd.Wait, so error
+	// paths here wait on done instead of double-calling Wait. The watcher
+	// will have logged the underlying exit error via slog.Warn.
 	select {
 	case p := <-portCh:
 		b.mu.Lock()
 		b.port = p
 		b.mu.Unlock()
 	case <-scannerDone:
-		// Scanner ended before emitting a port → child likely exited early
-		// (bad model, OOM, etc.). Reap cmd and surface Wait's error.
-		waitErr := cmd.Wait()
-		b.mu.Lock()
-		b.cmd = nil
-		b.port = 0
-		b.mu.Unlock()
-		if waitErr != nil {
-			return fmt.Errorf("llama-server exited before ready: %w", waitErr)
-		}
+		// Scanner ended before emitting a port → child exited early
+		// (bad model, OOM, etc.). Watcher will clear b.cmd.
+		<-done
 		return fmt.Errorf("llama-server exited before ready")
 	case <-ctx.Done():
 		_ = b.stopLocked(context.Background())
@@ -237,15 +240,7 @@ func (b *LlamaBackend) startLocked(ctx context.Context) error {
 		}
 		select {
 		case <-scannerDone:
-			// Child exited during health polling.
-			waitErr := cmd.Wait()
-			b.mu.Lock()
-			b.cmd = nil
-			b.port = 0
-			b.mu.Unlock()
-			if waitErr != nil {
-				return fmt.Errorf("llama-server exited during health check: %w", waitErr)
-			}
+			<-done
 			return fmt.Errorf("llama-server exited during health check")
 		case <-healthCtx.Done():
 			_ = b.stopLocked(context.Background())
@@ -253,6 +248,30 @@ func (b *LlamaBackend) startLocked(ctx context.Context) error {
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
+}
+
+// watchChild owns the single cmd.Wait() call for cmd. It reaps the child
+// immediately on exit (no zombie), clears b.cmd/b.port if they still point
+// to this cmd (so EnsureStarted re-spawns instead of probing a dead PID),
+// then closes done so blocked stopLocked / startLocked callers can proceed.
+// Logs a warning on unexpected exits — exits caused by an in-progress
+// stopLocked are silent (b.stopping == true).
+func (b *LlamaBackend) watchChild(cmd *exec.Cmd, done chan struct{}) {
+	err := cmd.Wait()
+	b.mu.Lock()
+	intentional := b.stopping
+	if b.cmd == cmd {
+		b.cmd = nil
+		b.port = 0
+	}
+	b.mu.Unlock()
+	// Log before close(done) so readers of done can rely on the log
+	// already being written — avoids a test-visible race and makes the
+	// ordering "child reaped → logged → others notified".
+	if !intentional && err != nil {
+		slog.Warn("backend: llama-server exited unexpectedly", "err", err)
+	}
+	close(done)
 }
 
 // getCmd returns the currently-running command under the mutex.
@@ -301,35 +320,35 @@ func (b *LlamaBackend) Stop(ctx context.Context) error {
 }
 
 func (b *LlamaBackend) stopLocked(ctx context.Context) error {
-	cmd := b.getCmd()
+	b.mu.Lock()
+	cmd := b.cmd
+	done := b.cmdDone
 	if cmd == nil || cmd.Process == nil {
+		b.mu.Unlock()
 		return nil
 	}
-	_ = cmd.Process.Signal(syscall.SIGTERM)
-
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-
-	clear := func() {
+	// stopping=true tells watchChild this exit is intentional → no warning log.
+	// Reset on return so a later spontaneous crash still gets logged.
+	b.stopping = true
+	b.mu.Unlock()
+	defer func() {
 		b.mu.Lock()
-		b.cmd = nil
-		b.port = 0
+		b.stopping = false
 		b.mu.Unlock()
-	}
+	}()
+
+	_ = cmd.Process.Signal(syscall.SIGTERM)
 
 	select {
 	case <-done:
-		clear()
 		return nil
 	case <-time.After(5 * time.Second):
 		_ = cmd.Process.Kill()
 		<-done
-		clear()
 		return nil
 	case <-ctx.Done():
 		_ = cmd.Process.Kill()
 		<-done
-		clear()
 		return ctx.Err()
 	}
 }
