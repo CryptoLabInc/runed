@@ -8,6 +8,11 @@
 // match. To bypass self-bootstrap entirely, set both RUNED_LLAMA_SERVER
 // and RUNED_MODEL to absolute paths.
 //
+// The gRPC UDS opens before self-bootstrap so clients can dial immediately
+// and poll Health for STATUS_LOADING + Phase/bytes progress instead of
+// seeing dial failures during the multi-minute install window. Embed and
+// EmbedBatch return FAILED_PRECONDITION until the backend is wired.
+//
 // Optional environment:
 //
 //	RUNED_HOME            Data directory (default: $HOME/.runed).
@@ -99,11 +104,64 @@ func run() error {
 		}
 	}
 
+	// ctx-size: RUNED_CTX_SIZE if valid, else backend default (2048).
+	ctxSize := 0
+	if v := os.Getenv("RUNED_CTX_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			ctxSize = n
+		} else {
+			logger.Warn("invalid RUNED_CTX_SIZE, using default", "value", v)
+		}
+	}
+
+	// Build the server and start serving the UDS BEFORE self-bootstrap +
+	// backend.Start so clients can dial immediately and poll Health for
+	// STATUS_LOADING / Phase / progress instead of seeing dial failures
+	// during the multi-minute install window. SetBackend wires the
+	// backend at the end; until then Embed/EmbedBatch return
+	// FAILED_PRECONDITION.
+	srv := server.New(daemonVersion)
+	lis, err := ipc.Listen(sockPath)
+	if err != nil {
+		return fmt.Errorf("ipc listen: %w", err)
+	}
+	logger.Info("listening", "socket", sockPath)
+
+	gs := grpc.NewServer(grpc.UnaryInterceptor(srv.UnaryActivityInterceptor()))
+	runedv1.RegisterRunedServiceServer(gs, srv)
+
+	// Serve in a goroutine so main can block on signals/Shutdown/serve error.
+	// gs.Serve returns nil on graceful stop; any non-nil err is a real fault.
+	serveErr := make(chan error, 1)
+	go func() {
+		if err := gs.Serve(lis); err != nil {
+			serveErr <- err
+		}
+		close(serveErr)
+	}()
+
+	// Forward bootstrap download progress into the Health surface. Each
+	// stage name maps to a proto Phase value; bytes flow through with
+	// matching messages so clients render percent-complete from one tuple.
+	reporter := bootstrap.StatusReporter(func(stage string, done, total int64) {
+		phase, msg := stagePhase(stage)
+		srv.SetBootstrapStatus(phase, done, total, msg)
+	})
+
 	llamaBin := os.Getenv("RUNED_LLAMA_SERVER")
 	model := os.Getenv("RUNED_MODEL")
 	if llamaBin == "" || model == "" {
-		bin, mp, err := selfBootstrap(ctx, logger, paths, llamaBin == "", model == "")
+		// Pre-set status before the reporter's first tick. Manifest fetch
+		// has no dedicated Phase enum (proto omits PHASE_FETCHING_MANIFEST
+		// to avoid coupling enum churn to wire-format changes), so we
+		// leave Phase = UNSPECIFIED and convey the stage through the
+		// message field — clients that surface message render correctly
+		// without depending on enum recognition. selfBootstrap overwrites
+		// Phase once ensure{LlamaServer,Model} enters its own stage.
+		srv.SetBootstrapStatus(runedv1.HealthResponse_PHASE_UNSPECIFIED, 0, 0, "fetching manifest")
+		bin, mp, err := selfBootstrap(ctx, logger, paths, llamaBin == "", model == "", reporter)
 		if err != nil {
+			bailBoot(logger, srv, gs, nil)
 			return err
 		}
 		if llamaBin == "" {
@@ -117,18 +175,11 @@ func run() error {
 			"llama_server", llamaBin, "model", model)
 	}
 
-	// ctx-size: RUNED_CTX_SIZE if valid, else backend default (2048).
-	ctxSize := 0
-	if v := os.Getenv("RUNED_CTX_SIZE"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			ctxSize = n
-		} else {
-			logger.Warn("invalid RUNED_CTX_SIZE, using default", "value", v)
-		}
-	}
+	srv.SetBootstrapStatus(runedv1.HealthResponse_PHASE_STARTING_LLAMA_SERVER, 0, 0, "starting llama-server")
 
 	modelID, err := sha256File(model)
 	if err != nil {
+		bailBoot(logger, srv, gs, nil)
 		return fmt.Errorf("model hash: %w", err)
 	}
 	logger.Info("model identity", "sha256", modelID, "path", model)
@@ -146,35 +197,21 @@ func run() error {
 	// backend.Start already bounds start-up on its own (~15s health poll +
 	// early-exit detection via the stderr scanner).
 	if err := b.Start(ctx); err != nil {
+		// b.Start may have spawned a child that failed health-probe,
+		// leaving an orphan llama-server holding ~470MB. bailBoot reaps
+		// it via b.Stop (idempotent on never-spawned backends).
+		bailBoot(logger, srv, gs, b)
 		return fmt.Errorf("backend start: %w", err)
 	}
 	logger.Info("llama-server ready", "port", b.Port())
 
-	lis, err := ipc.Listen(sockPath)
-	if err != nil {
-		// Best-effort backend cleanup — we have no logger-side context to thread here.
-		_ = b.Stop(context.Background())
-		return fmt.Errorf("ipc listen: %w", err)
-	}
-	logger.Info("listening", "socket", sockPath)
-
-	srv := server.New(b, daemonVersion, modelID)
-	gs := grpc.NewServer(grpc.UnaryInterceptor(srv.UnaryActivityInterceptor()))
-	runedv1.RegisterRunedServiceServer(gs, srv)
-
-	// Serve in a goroutine so main can block on signals/Shutdown/serve error.
-	// gs.Serve returns nil on graceful stop; any non-nil err is a real fault.
-	serveErr := make(chan error, 1)
-	go func() {
-		if err := gs.Serve(lis); err != nil {
-			serveErr <- err
-		}
-		close(serveErr)
-	}()
+	// Backend up — wire it into the server. From here on Health reports
+	// STATUS_OK and Embed/EmbedBatch accept work.
+	srv.SetBackend(b, modelID)
 
 	idleTimeout, err := parseIdleTimeout()
 	if err != nil {
-		_ = b.Stop(context.Background())
+		bailBoot(logger, srv, gs, b)
 		return fmt.Errorf("RUNED_IDLE_TIMEOUT: %w", err)
 	}
 	if idleTimeout > 0 {
@@ -236,6 +273,12 @@ func run() error {
 		}
 	}
 
+	// Ensure shutdownCh is closed even when the trigger was an OS signal or
+	// a serve error — Health then advertises STATUS_SHUTTING_DOWN during
+	// the drain window. sync.Once makes a second call (after a Shutdown
+	// RPC) a no-op.
+	srv.TriggerShutdown()
+
 	// Phase 1: drain in-flight RPCs. GracefulStop blocks until all active
 	// handlers return; 10s is a safety net for a wedged client.
 	logger.Info("draining in-flight requests")
@@ -271,7 +314,10 @@ func run() error {
 // Only those sides are downloaded — the env-overridden side is skipped
 // so its manifest artifact isn't fetched only to be discarded. When
 // both are needed, EnsureAll's single-lock fast path is used.
-func selfBootstrap(ctx context.Context, logger *slog.Logger, paths *bootstrap.Paths, needLlama, needModel bool) (binPath, modelPath string, err error) {
+//
+// reporter is the optional status sink for download-byte progress (see
+// bootstrap.StatusReporter). Pass nil when no sink is wired.
+func selfBootstrap(ctx context.Context, logger *slog.Logger, paths *bootstrap.Paths, needLlama, needModel bool, reporter bootstrap.StatusReporter) (binPath, modelPath string, err error) {
 	manifestURL := bootstrap.ResolveManifestURL()
 	if manifestURL == "" {
 		return "", "", fmt.Errorf(
@@ -298,7 +344,7 @@ func selfBootstrap(ctx context.Context, logger *slog.Logger, paths *bootstrap.Pa
 	switch {
 	case needLlama && needModel:
 		var variant string
-		binPath, modelPath, variant, err = bootstrap.EnsureAll(ctx, paths, mani, logger)
+		binPath, modelPath, variant, err = bootstrap.EnsureAll(ctx, paths, mani, logger, reporter)
 		if err != nil {
 			return "", "", fmt.Errorf("bootstrap install: %w", err)
 		}
@@ -307,7 +353,7 @@ func selfBootstrap(ctx context.Context, logger *slog.Logger, paths *bootstrap.Pa
 			"model", modelPath,
 			"variant", variant)
 	case needLlama:
-		binPath, err = bootstrap.EnsureLlamaServer(ctx, paths, mani, logger)
+		binPath, err = bootstrap.EnsureLlamaServer(ctx, paths, mani, logger, reporter)
 		if err != nil {
 			return "", "", fmt.Errorf("bootstrap install: %w", err)
 		}
@@ -315,7 +361,7 @@ func selfBootstrap(ctx context.Context, logger *slog.Logger, paths *bootstrap.Pa
 			"llama_server", binPath)
 	case needModel:
 		var variant string
-		modelPath, variant, err = bootstrap.EnsureModel(ctx, paths, mani, logger)
+		modelPath, variant, err = bootstrap.EnsureModel(ctx, paths, mani, logger, reporter)
 		if err != nil {
 			return "", "", fmt.Errorf("bootstrap install: %w", err)
 		}
@@ -326,6 +372,56 @@ func selfBootstrap(ctx context.Context, logger *slog.Logger, paths *bootstrap.Pa
 		return "", "", fmt.Errorf("selfBootstrap called with nothing to do")
 	}
 	return binPath, modelPath, nil
+}
+
+// stagePhase maps a bootstrap.StatusReporter stage name to the proto
+// HealthResponse_Phase value and a short user-facing message. Returning
+// PHASE_UNSPECIFIED on unknown stages keeps the surface forward-compatible
+// with future bootstrap stages.
+func stagePhase(stage string) (runedv1.HealthResponse_Phase, string) {
+	switch stage {
+	case "llama_server":
+		return runedv1.HealthResponse_PHASE_FETCHING_LLAMA_SERVER, "fetching llama-server"
+	case "model":
+		return runedv1.HealthResponse_PHASE_FETCHING_MODEL, "fetching embedding model"
+	default:
+		return runedv1.HealthResponse_PHASE_UNSPECIFIED, ""
+	}
+}
+
+// bailBoot drives the same graceful-shutdown sequence as the normal exit
+// path so an early failure during boot still flips Health to
+// STATUS_SHUTTING_DOWN, drains in-flight RPCs, and reaps the backend if
+// it managed to spawn. b may be nil when boot fails before
+// backend.NewLlamaBackend ran; b.Stop is idempotent on never-spawned
+// backends and on backends that already returned, so a non-nil b is
+// always safe to pass.
+func bailBoot(logger *slog.Logger, srv *server.Server, gs *grpc.Server, b *backend.LlamaBackend) {
+	srv.TriggerShutdown()
+	stopGRPC(logger, gs)
+	if b != nil {
+		_ = b.Stop(context.Background())
+	}
+}
+
+// stopGRPC drives a 10s-bounded GracefulStop and falls back to Stop on
+// timeout. Used by the early-fail paths in run() (bootstrap / backend
+// startup failure) where the listener is already up but no backend has
+// been wired — in-flight RPCs are at most Health/Info, so the grace
+// window is effectively a courtesy.
+func stopGRPC(logger *slog.Logger, gs *grpc.Server) {
+	graceDone := make(chan struct{})
+	go func() {
+		gs.GracefulStop()
+		close(graceDone)
+	}()
+	select {
+	case <-graceDone:
+	case <-time.After(10 * time.Second):
+		logger.Warn("graceful stop timed out, forcing")
+		gs.Stop()
+		<-graceDone
+	}
 }
 
 // anotherDaemonReachable returns true if a UDS listener accepts our dial
