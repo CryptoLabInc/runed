@@ -1,14 +1,20 @@
 // Command runed is the embedding daemon.
 //
-// Required environment:
-//
-//	RUNED_LLAMA_SERVER   Path to llama-server binary.
-//	RUNED_MODEL          Path to GGUF model file.
+// Self-bootstrap: when RUNED_LLAMA_SERVER or RUNED_MODEL is unset, runed
+// downloads the llama-server release tarball and embedding GGUF described
+// by the manifest at RUNED_MANIFEST (or the build-time DefaultManifestURL)
+// into $RUNED_HOME/{bin/llama-cpp,models}/ on first boot. Subsequent boots
+// reuse the installed artifacts as long as the manifest SHA-256s still
+// match. To bypass self-bootstrap entirely, set both RUNED_LLAMA_SERVER
+// and RUNED_MODEL to absolute paths.
 //
 // Optional environment:
 //
-//	RUNED_HOME           Data directory (default: $HOME/.runed).
-//	RUNED_CTX_SIZE       Max input length in tokens; lower = less KV-cache memory (default: 2048).
+//	RUNED_HOME            Data directory (default: $HOME/.runed).
+//	RUNED_CTX_SIZE        Max input length in tokens; lower = less KV-cache memory (default: 2048).
+//	RUNED_MODEL_VARIANT   Override manifest.default_model (e.g. "qwen3-embedding-0.6b.q8_0").
+//	RUNED_MANIFEST        Manifest URL for self-bootstrap. Overrides DefaultManifestURL baked at build.
+//	RUNED_IDLE_TIMEOUT    Idle exit duration (default: 10m; "0" disables).
 //
 // The daemon listens on $RUNED_HOME/embedding.sock (UDS) and terminates
 // gracefully on SIGINT, SIGTERM, or a Shutdown RPC. Graceful termination
@@ -23,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -33,6 +40,7 @@ import (
 
 	runedv1 "github.com/CryptoLabInc/runed/gen/runed/v1"
 	"github.com/CryptoLabInc/runed/internal/backend"
+	"github.com/CryptoLabInc/runed/internal/bootstrap"
 	"github.com/CryptoLabInc/runed/internal/ipc"
 	"github.com/CryptoLabInc/runed/internal/server"
 	"google.golang.org/grpc"
@@ -54,31 +62,54 @@ func run() error {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
-	llamaBin := os.Getenv("RUNED_LLAMA_SERVER")
-	model := os.Getenv("RUNED_MODEL")
-	var missing []string
-	if llamaBin == "" {
-		missing = append(missing, "RUNED_LLAMA_SERVER")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	paths, err := bootstrap.Resolve()
+	if err != nil {
+		return fmt.Errorf("resolve paths: %w", err)
 	}
-	if model == "" {
-		missing = append(missing, "RUNED_MODEL")
+	if err := paths.EnsureDirs(); err != nil {
+		return fmt.Errorf("ensure dirs: %w", err)
 	}
-	if len(missing) > 0 {
-		return fmt.Errorf("required env var(s) not set: %s", strings.Join(missing, ", "))
+	logger.Info("paths resolved", "home", paths.Home)
+
+	sockPath := filepath.Join(paths.Home, "embedding.sock")
+
+	// Early bail-out: if another daemon is already accepting connections on
+	// our socket, we'd just waste time on self-bootstrap before failing at
+	// the listen step. Exit 0 because "already running" is a no-op success
+	// from the caller's perspective (rune spawn, systemd restart, etc.).
+	if anotherDaemonReachable(ctx, sockPath) {
+		logger.Info("another runed daemon is already serving this socket; exiting",
+			"socket", sockPath)
+		return nil
+	}
+	// Stale socket file (no listener) — remove so our own listen succeeds.
+	// This happens after SIGKILL / OOM where graceful shutdown didn't run.
+	if _, err := os.Stat(sockPath); err == nil {
+		logger.Info("removing stale socket file", "socket", sockPath)
+		if err := os.Remove(sockPath); err != nil {
+			return fmt.Errorf("remove stale socket %s: %w", sockPath, err)
+		}
 	}
 
-	home := os.Getenv("RUNED_HOME")
-	if home == "" {
-		u, err := os.UserHomeDir()
+	llamaBin := os.Getenv("RUNED_LLAMA_SERVER")
+	model := os.Getenv("RUNED_MODEL")
+	if llamaBin == "" || model == "" {
+		bin, mp, err := selfBootstrap(ctx, logger, paths, llamaBin == "", model == "")
 		if err != nil {
-			return fmt.Errorf("home dir: %w", err)
+			return err
 		}
-		home = filepath.Join(u, ".runed")
-	}
-	sockPath := filepath.Join(home, "embedding.sock")
-	logDir := filepath.Join(home, "logs")
-	if err := os.MkdirAll(logDir, 0o700); err != nil {
-		return fmt.Errorf("logs dir: %w", err)
+		if llamaBin == "" {
+			llamaBin = bin
+		}
+		if model == "" {
+			model = mp
+		}
+	} else {
+		logger.Info("skipping self-bootstrap; both env paths provided",
+			"llama_server", llamaBin, "model", model)
 	}
 
 	// ctx-size: RUNED_CTX_SIZE if valid, else backend default (2048).
@@ -97,14 +128,11 @@ func run() error {
 	}
 	logger.Info("model identity", "sha256", modelID, "path", model)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	logger.Info("starting llama-server", "binary", llamaBin, "model", model)
 	b := backend.NewLlamaBackend(backend.Config{
 		BinaryPath: llamaBin,
 		ModelPath:  model,
-		LogPath:    filepath.Join(logDir, "llama-server.log"),
+		LogPath:    filepath.Join(paths.Logs, "llama-server.log"),
 		CtxSize:    ctxSize,
 	})
 	// NOTE: backend uses exec.CommandContext(ctx, ...) internally, which means
@@ -216,6 +244,88 @@ func run() error {
 	}
 	logger.Info("shutdown complete")
 	return nil
+}
+
+// selfBootstrap fetches the manifest and ensures llama-server and the
+// resolved model variant are present under paths. Called whenever
+// RUNED_LLAMA_SERVER or RUNED_MODEL is unset; bypassed entirely when
+// both are provided.
+//
+// needLlama / needModel reflect which side(s) the caller still needs.
+// Only those sides are downloaded — the env-overridden side is skipped
+// so its manifest artifact isn't fetched only to be discarded. When
+// both are needed, EnsureAll's single-lock fast path is used.
+func selfBootstrap(ctx context.Context, logger *slog.Logger, paths *bootstrap.Paths, needLlama, needModel bool) (binPath, modelPath string, err error) {
+	manifestURL := bootstrap.ResolveManifestURL()
+	if manifestURL == "" {
+		return "", "", fmt.Errorf(
+			"self-bootstrap needed (RUNED_LLAMA_SERVER or RUNED_MODEL unset) but no manifest URL: set %s or rebuild with DEFAULT_MANIFEST_URL",
+			bootstrap.EnvManifest)
+	}
+	// HTTPS isn't enforced because a private network may legitimately serve
+	// the manifest over plain HTTP. But callers should know: a MITM that
+	// rewrites the manifest can also rewrite the SHA256s, so artifact
+	// integrity collapses to "trust the manifest channel."
+	if !strings.HasPrefix(manifestURL, "https://") {
+		logger.Warn("manifest URL is not HTTPS; artifact integrity rests on manifest channel trust",
+			"url", manifestURL)
+	}
+	logger.Info("self-bootstrap: fetching manifest", "url", manifestURL)
+	mani, err := bootstrap.FetchManifest(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf("bootstrap manifest: %w", err)
+	}
+	logger.Info("self-bootstrap: manifest parsed",
+		"platforms", len(mani.Platforms),
+		"models", len(mani.Models),
+		"default_model", mani.DefaultModel)
+	switch {
+	case needLlama && needModel:
+		var variant string
+		binPath, modelPath, variant, err = bootstrap.EnsureAll(ctx, paths, mani, logger)
+		if err != nil {
+			return "", "", fmt.Errorf("bootstrap install: %w", err)
+		}
+		logger.Info("self-bootstrap ready",
+			"llama_server", binPath,
+			"model", modelPath,
+			"variant", variant)
+	case needLlama:
+		binPath, err = bootstrap.EnsureLlamaServer(ctx, paths, mani, logger)
+		if err != nil {
+			return "", "", fmt.Errorf("bootstrap install: %w", err)
+		}
+		logger.Info("self-bootstrap ready (llama-server only; model from env)",
+			"llama_server", binPath)
+	case needModel:
+		var variant string
+		modelPath, variant, err = bootstrap.EnsureModel(ctx, paths, mani, logger)
+		if err != nil {
+			return "", "", fmt.Errorf("bootstrap install: %w", err)
+		}
+		logger.Info("self-bootstrap ready (model only; llama-server from env)",
+			"model", modelPath,
+			"variant", variant)
+	default:
+		return "", "", fmt.Errorf("selfBootstrap called with nothing to do")
+	}
+	return binPath, modelPath, nil
+}
+
+// anotherDaemonReachable returns true if a UDS listener accepts our dial
+// at sockPath within 500ms. False covers both "file missing" and "file
+// exists but nobody listening" (the latter is a stale-socket case the
+// caller should clean up before its own listen).
+func anotherDaemonReachable(ctx context.Context, sockPath string) bool {
+	cctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	var d net.Dialer
+	conn, err := d.DialContext(cctx, "unix", sockPath)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
 }
 
 // sha256File returns a short, prefixed SHA-256 identifier of the file at path.

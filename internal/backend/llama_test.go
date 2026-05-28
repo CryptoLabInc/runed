@@ -9,8 +9,9 @@ import (
 )
 
 // Integration test: requires env vars pointing at real llama-server binary and GGUF.
-//   RUNED_TEST_LLAMA_SERVER=/path/to/llama-server
-//   RUNED_TEST_GGUF=/path/to/qwen3-embedding-0.6b.f16.gguf
+//
+//	RUNED_TEST_LLAMA_SERVER=/path/to/llama-server
+//	RUNED_TEST_GGUF=/path/to/qwen3-embedding-0.6b.f16.gguf
 func TestLlamaBackend_SpawnAndHealthy(t *testing.T) {
 	srv := os.Getenv("RUNED_TEST_LLAMA_SERVER")
 	gguf := os.Getenv("RUNED_TEST_GGUF")
