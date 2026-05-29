@@ -249,17 +249,20 @@ func run() error {
 	// SIGKILL cannot be intercepted from user space.
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
+	// All exit triggers share the cleanup below. Only a serve fault yields a
+	// non-zero process exit; capture it and return after cleanup rather than
+	// bailing early, so the drain-then-stop ordering still applies.
+	var exitErr error
 	select {
 	case s := <-sigCh:
 		logger.Info("received signal", "signal", s.String())
 	case <-srv.ShutdownCh():
 		logger.Info("received Shutdown RPC")
 	case err := <-serveErr:
+		// Non-nil err is a real fault (Serve returns nil only on graceful stop).
 		if err != nil {
 			logger.Error("gRPC serve error", "err", err)
-			// Still fall through to backend cleanup below.
-			_ = b.Stop(context.Background())
-			return fmt.Errorf("serve: %w", err)
+			exitErr = fmt.Errorf("serve: %w", err)
 		}
 	}
 
@@ -291,7 +294,7 @@ func run() error {
 		logger.Warn("backend stop returned error", "err", err)
 	}
 	logger.Info("shutdown complete")
-	return nil
+	return exitErr
 }
 
 // selfBootstrap fetches the manifest and installs the side(s) the
