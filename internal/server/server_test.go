@@ -11,20 +11,26 @@ import (
 	runedv1 "github.com/CryptoLabInc/runed/gen/runed/v1"
 	"github.com/CryptoLabInc/runed/internal/backend"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
-// newInProcessServer wires a Server{} to a loopback listener and returns a
-// client plus a cleanup that shuts both ends down. It deliberately uses a
-// random port (":0") so multiple tests can run in parallel without port clash.
+// newInProcessServer wires a Server to a loopback listener. b == nil
+// leaves the server pre-SetBackend (Health = LOADING, Embed =
+// FAILED_PRECONDITION); non-nil b is wired with a synthetic model id.
 func newInProcessServer(t *testing.T, b *backend.LlamaBackend) (runedv1.RunedServiceClient, func()) {
 	t.Helper()
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	s := New("v0.1.0-test")
+	if b != nil {
+		s.SetBackend(b, "test-model-id")
+	}
 	gs := grpc.NewServer()
-	runedv1.RegisterRunedServiceServer(gs, New(b, "v0.1.0-test", "test-model-id"))
+	runedv1.RegisterRunedServiceServer(gs, s)
 	go gs.Serve(lis)
 
 	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -111,7 +117,7 @@ func TestServer_InfoMaxTextLengthTracksCtxSize(t *testing.T) {
 
 func TestServer_LastActivity_InitializedAtConstruction(t *testing.T) {
 	before := time.Now()
-	s := New(backend.NewLlamaBackend(backend.Config{}), "vtest", "model-test")
+	s := New("vtest")
 	after := time.Now()
 	got := s.LastActivity()
 	if got.Before(before) || got.After(after) {
@@ -120,7 +126,7 @@ func TestServer_LastActivity_InitializedAtConstruction(t *testing.T) {
 }
 
 func TestServer_TriggerShutdown_Idempotent(t *testing.T) {
-	s := New(backend.NewLlamaBackend(backend.Config{}), "vtest", "model-test")
+	s := New("vtest")
 	// Two concurrent TriggerShutdown calls must not panic (sync.Once).
 	var wg sync.WaitGroup
 	for i := 0; i < 4; i++ {
@@ -140,7 +146,7 @@ func TestServer_TriggerShutdown_Idempotent(t *testing.T) {
 }
 
 func TestServer_UnaryActivityInterceptor_UpdatesLastActivity(t *testing.T) {
-	s := New(backend.NewLlamaBackend(backend.Config{}), "vtest", "model-test")
+	s := New("vtest")
 	initial := s.LastActivity()
 	time.Sleep(2 * time.Millisecond) // ensure new nanosecond bucket
 
@@ -161,7 +167,7 @@ func TestServer_UnaryActivityInterceptor_UpdatesLastActivity(t *testing.T) {
 	}
 }
 
-// Before self-bootstrap provide progress, values should be zero
+// Before self-bootstrap provides progress, values should be zero
 func TestServer_HealthBootstrapFieldsDefaultZero(t *testing.T) {
 	b := backend.NewLlamaBackend(backend.Config{}) // not started — Health uses the unhealthy path
 	client, cleanup := newInProcessServer(t, b)
@@ -185,5 +191,99 @@ func TestServer_HealthBootstrapFieldsDefaultZero(t *testing.T) {
 	}
 	if h.Message != "" {
 		t.Errorf("Message = %q, want empty", h.Message)
+	}
+}
+
+func TestServer_HealthLoadingBeforeSetBackend(t *testing.T) {
+	client, cleanup := newInProcessServer(t, nil)
+	defer cleanup()
+
+	h, err := client.Health(context.Background(), &runedv1.HealthRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Status != runedv1.HealthResponse_STATUS_LOADING {
+		t.Errorf("Status = %v, want STATUS_LOADING (backend not wired)", h.Status)
+	}
+}
+
+func TestServer_HealthLoadingReflectsSetBootstrapStatus(t *testing.T) {
+	s := New("vtest")
+	s.SetBootstrapStatus(
+		runedv1.HealthResponse_PHASE_FETCHING_MODEL,
+		123, 456, "downloading X")
+
+	resp, err := s.Health(context.Background(), &runedv1.HealthRequest{})
+	if err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if resp.Status != runedv1.HealthResponse_STATUS_LOADING {
+		t.Errorf("Status = %v, want STATUS_LOADING", resp.Status)
+	}
+	if resp.Phase != runedv1.HealthResponse_PHASE_FETCHING_MODEL {
+		t.Errorf("Phase = %v, want PHASE_FETCHING_MODEL", resp.Phase)
+	}
+	if resp.BytesDone != 123 || resp.BytesTotal != 456 {
+		t.Errorf("bytes: got done=%d total=%d, want 123/456", resp.BytesDone, resp.BytesTotal)
+	}
+	if resp.Message != "downloading X" {
+		t.Errorf("Message = %q, want %q", resp.Message, "downloading X")
+	}
+}
+
+// FAILED_PRECONDITION (not Unavailable) so client retry policies don't
+// consume budget against a non-ready daemon.
+func TestServer_EmbedFailsBeforeBackendSet(t *testing.T) {
+	s := New("vtest")
+	_, err := s.Embed(context.Background(), &runedv1.EmbedRequest{Text: "x"})
+	if err == nil {
+		t.Fatal("expected error before SetBackend")
+	}
+	if got := status.Code(err); got != codes.FailedPrecondition {
+		t.Errorf("code = %v, want %v", got, codes.FailedPrecondition)
+	}
+}
+
+func TestServer_EmbedBatchFailsBeforeBackendSet(t *testing.T) {
+	s := New("vtest")
+	_, err := s.EmbedBatch(context.Background(), &runedv1.EmbedBatchRequest{Texts: []string{"x"}})
+	if err == nil {
+		t.Fatal("expected error before SetBackend")
+	}
+	if got := status.Code(err); got != codes.FailedPrecondition {
+		t.Errorf("code = %v, want %v", got, codes.FailedPrecondition)
+	}
+}
+
+func TestServer_HealthShuttingDownAfterTrigger(t *testing.T) {
+	s := New("vtest")
+	s.TriggerShutdown()
+
+	resp, err := s.Health(context.Background(), &runedv1.HealthRequest{})
+	if err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if resp.Status != runedv1.HealthResponse_STATUS_SHUTTING_DOWN {
+		t.Errorf("Status = %v, want STATUS_SHUTTING_DOWN", resp.Status)
+	}
+}
+
+// Pins SHUTTING_DOWN > LOADING priority so future Health refactors
+// don't surface LOADING during drain.
+func TestServer_HealthShuttingDownOutranksLoading(t *testing.T) {
+	s := New("vtest")
+	// backend nil → LOADING candidate; bootstrap status would normally
+	// shape the LOADING response.
+	s.SetBootstrapStatus(
+		runedv1.HealthResponse_PHASE_FETCHING_MODEL,
+		50, 100, "downloading model")
+	s.TriggerShutdown()
+
+	resp, err := s.Health(context.Background(), &runedv1.HealthRequest{})
+	if err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if resp.Status != runedv1.HealthResponse_STATUS_SHUTTING_DOWN {
+		t.Errorf("Status = %v, want STATUS_SHUTTING_DOWN (must outrank LOADING)", resp.Status)
 	}
 }

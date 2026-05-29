@@ -42,21 +42,21 @@ var downloadRetryBackoff = 5 * time.Second
 
 const retryBackoffMultiplier = 3
 
-// EnsureAll resolves the model variant and ensures both llama-server and
-// the model GGUF are present, downloading any missing pieces while
-// holding $RUNED_HOME/install.lock. Returns the absolute path to the
-// llama-server executable and the GGUF file the daemon should load.
+// StatusReporter receives throttled progress ticks from Ensure* tagged
+// with stage ("llama_server" or "model"). bytesTotal == 0 means the
+// total isn't yet known (no Content-Length observed). nil is a valid
+// "no sink" value; reporter calls run inline on the download goroutine
+// and should return quickly.
+type StatusReporter func(stage string, bytesDone, bytesTotal int64)
+
+// EnsureAll ensures both llama-server and the model GGUF are installed
+// under a single lock acquisition. Use when both RUNED_LLAMA_SERVER and
+// RUNED_MODEL are unset; for the partial-set case, call
+// EnsureLlamaServer / EnsureModel individually so the env-overridden
+// side isn't redownloaded only to be discarded.
 //
-// This is the normal-path entry point: both RUNED_LLAMA_SERVER and
-// RUNED_MODEL unset → manifest-driven install of everything. When only
-// one env var is set, callers should use EnsureLlamaServer or
-// EnsureModel directly so the side they already have isn't redownloaded
-// only to be discarded by the env override.
-//
-// logger may be nil; slog.Default() is used in that case. All progress
-// and per-step status is emitted through this logger — callers don't
-// need to thread a separate ProgressFunc.
-func EnsureAll(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger) (llamaBin, modelPath, variant string, err error) {
+// logger may be nil (slog.Default used). reporter may be nil.
+func EnsureAll(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger, reporter StatusReporter) (llamaBin, modelPath, variant string, err error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -71,56 +71,57 @@ func EnsureAll(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger) 
 		"variant", variant,
 		"default_model", m.DefaultModel)
 
+	// Stage tick before AcquireLock so a lock-waiting trailer surfaces
+	// the right Phase while it waits.
+	if reporter != nil {
+		reporter("llama_server", 0, 0)
+	}
 	lock, err := AcquireLock(p.InstallLock, InstallLockTimeout)
 	if err != nil {
 		return "", "", "", fmt.Errorf("install lock: %w", err)
 	}
 	defer lock.Release()
 
-	llamaBin, err = ensureLlamaServer(ctx, p, m, logger)
+	llamaBin, err = ensureLlamaServer(ctx, p, m, logger, reporter)
 	if err != nil {
 		return "", "", "", err
 	}
-	modelPath, err = ensureModel(ctx, p, m, variant, logger)
+	if reporter != nil {
+		reporter("model", 0, 0)
+	}
+	modelPath, err = ensureModel(ctx, p, m, variant, logger, reporter)
 	if err != nil {
 		return "", "", "", err
 	}
 	return llamaBin, modelPath, variant, nil
 }
 
-// EnsureLlamaServer ensures only the llama-server binary is present and
-// returns its absolute path. Use when the caller already has a model
-// path (e.g. RUNED_MODEL is set) and only the llama-server side needs
-// the manifest install.
-//
-// The manifest must include an entry for the current platform —
-// LlamaServerForCurrentPlatform is consulted unconditionally here, which
-// is fine because the caller explicitly asked for the manifest's
-// llama-server.
-func EnsureLlamaServer(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger) (string, error) {
+// EnsureLlamaServer ensures the llama-server binary is installed. The
+// manifest must have an entry for the current platform (this is the
+// caller's intent — they explicitly asked for the manifest's binary).
+func EnsureLlamaServer(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger, reporter StatusReporter) (string, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	if err := p.EnsureDirs(); err != nil {
 		return "", err
 	}
+	if reporter != nil {
+		reporter("llama_server", 0, 0)
+	}
 	lock, err := AcquireLock(p.InstallLock, InstallLockTimeout)
 	if err != nil {
 		return "", fmt.Errorf("install lock: %w", err)
 	}
 	defer lock.Release()
-	return ensureLlamaServer(ctx, p, m, logger)
+	return ensureLlamaServer(ctx, p, m, logger, reporter)
 }
 
-// EnsureModel ensures only the model GGUF is present and returns the
-// absolute path plus the resolved variant ID. Use when the caller
-// already has a llama-server path (e.g. RUNED_LLAMA_SERVER is set) and
-// only the model side needs the manifest install.
-//
-// LlamaServerForCurrentPlatform is not called here, so a caller on a
-// platform missing from the manifest can still bootstrap a model as
-// long as their RUNED_LLAMA_SERVER points at a working binary.
-func EnsureModel(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger) (modelPath, variant string, err error) {
+// EnsureModel ensures the model GGUF is installed. Skips
+// LlamaServerForCurrentPlatform so a caller on a platform missing from
+// the manifest can still bootstrap a model when RUNED_LLAMA_SERVER
+// points at a working binary.
+func EnsureModel(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger, reporter StatusReporter) (modelPath, variant string, err error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -135,13 +136,16 @@ func EnsureModel(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger
 		"variant", variant,
 		"default_model", m.DefaultModel)
 
+	if reporter != nil {
+		reporter("model", 0, 0)
+	}
 	lock, err := AcquireLock(p.InstallLock, InstallLockTimeout)
 	if err != nil {
 		return "", "", fmt.Errorf("install lock: %w", err)
 	}
 	defer lock.Release()
 
-	modelPath, err = ensureModel(ctx, p, m, variant, logger)
+	modelPath, err = ensureModel(ctx, p, m, variant, logger, reporter)
 	if err != nil {
 		return "", "", err
 	}
@@ -186,10 +190,10 @@ func downloadWithRetry(ctx context.Context, url, sha string, size int64, dest st
 }
 
 // makeProgress returns a throttled ProgressFunc that logs at most one
-// line per progressLogInterval, plus a final 100% line on completion.
-// total ≤ 0 means Content-Length wasn't advertised; the function falls
-// back to byte-count-only output.
-func makeProgress(logger *slog.Logger, stage string, expectedTotal int64) ProgressFunc {
+// line per progressLogInterval and, if reporter != nil, forwards the
+// same throttled tick. total ≤ 0 means Content-Length wasn't advertised;
+// falls back to byte-count-only output.
+func makeProgress(logger *slog.Logger, reporter StatusReporter, stage string, expectedTotal int64) ProgressFunc {
 	var lastReport time.Time
 	return func(downloaded, observedTotal int64) {
 		total := expectedTotal
@@ -207,6 +211,9 @@ func makeProgress(logger *slog.Logger, stage string, expectedTotal int64) Progre
 			attrs = append(attrs, "total", total, "pct", fmt.Sprintf("%.1f%%", pct))
 		}
 		logger.Info("download progress", attrs...)
+		if reporter != nil {
+			reporter(stage, downloaded, total)
+		}
 	}
 }
 
@@ -234,7 +241,8 @@ func ResolveModelVariant(p *Paths, m *Manifest) (string, error) {
 // extracting or downloading the artifact as needed. A sidecar marker
 // file (.llama_server.sha256) tracks the last-installed tarball hash so
 // repeat boots don't re-extract.
-func ensureLlamaServer(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger) (string, error) {
+func ensureLlamaServer(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger, reporter StatusReporter) (string, error) {
+	// Caller emits the stage tick before AcquireLock.
 	spec, err := m.LlamaServerForCurrentPlatform()
 	if err != nil {
 		return "", err
@@ -259,7 +267,7 @@ func ensureLlamaServer(ctx context.Context, p *Paths, m *Manifest, logger *slog.
 			"target", target)
 	}
 
-	progress := makeProgress(logger, "llama_server", spec.Size)
+	progress := makeProgress(logger, reporter, "llama_server", spec.Size)
 	switch spec.Extract {
 	case "":
 		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
@@ -314,7 +322,8 @@ func llamaServerTarget(p *Paths, spec *LlamaServerSpec) string {
 	return filepath.Join(p.LlamaDir, filepath.FromSlash(exec))
 }
 
-func ensureModel(ctx context.Context, p *Paths, m *Manifest, variant string, logger *slog.Logger) (string, error) {
+func ensureModel(ctx context.Context, p *Paths, m *Manifest, variant string, logger *slog.Logger, reporter StatusReporter) (string, error) {
+	// Caller emits the stage tick before invoking us.
 	spec, err := m.ModelSpec(variant)
 	if err != nil {
 		return "", err
@@ -338,7 +347,7 @@ func ensureModel(ctx context.Context, p *Paths, m *Manifest, variant string, log
 		return "", err
 	}
 	logger.Info("ensure model: downloading GGUF", "url", spec.URL)
-	progress := makeProgress(logger, "model", spec.Size)
+	progress := makeProgress(logger, reporter, "model", spec.Size)
 	if err := downloadWithRetry(ctx, spec.URL, spec.SHA256, spec.Size, target, progress, logger, "model"); err != nil {
 		return "", fmt.Errorf("ensure model: download: %w", err)
 	}

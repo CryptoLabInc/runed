@@ -164,9 +164,6 @@ func writeConfig(t *testing.T, path, body string) {
 	}
 }
 
-// EnsureLlamaServer surfaces the manifest-platform-missing error directly:
-// callers that explicitly asked for the manifest's llama-server can't be
-// rescued by env override of the model side.
 func TestEnsureLlamaServer_PlatformMissingFails(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(EnvHome, dir)
@@ -178,14 +175,13 @@ func TestEnsureLlamaServer_PlatformMissingFails(t *testing.T) {
 		Models:    map[string]ArtifactSpec{},
 	}
 
-	if _, err := EnsureLlamaServer(t.Context(), p, m, slog.Default()); !errors.Is(err, ErrNoArtifactForPlatform) {
+	if _, err := EnsureLlamaServer(t.Context(), p, m, slog.Default(), nil); !errors.Is(err, ErrNoArtifactForPlatform) {
 		t.Fatalf("expected ErrNoArtifactForPlatform, got: %v", err)
 	}
 }
 
-// EnsureModel must not consult LlamaServerForCurrentPlatform: a caller on
-// a platform missing from the manifest who already has RUNED_LLAMA_SERVER
-// set should still be able to bootstrap a model.
+// A caller on a platform missing from the manifest can still bootstrap
+// the model side (LlamaServerForCurrentPlatform is not consulted).
 func TestEnsureModel_NoLlamaServerEntryNeeded(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(EnvHome, dir)
@@ -220,7 +216,7 @@ func TestEnsureModel_NoLlamaServerEntryNeeded(t *testing.T) {
 		DefaultModel: variant,
 	}
 
-	got, gotVariant, err := EnsureModel(t.Context(), p, m, slog.Default())
+	got, gotVariant, err := EnsureModel(t.Context(), p, m, slog.Default(), nil)
 	if err != nil {
 		t.Fatalf("EnsureModel must succeed when no llama-server entry is present: %v", err)
 	}
@@ -229,5 +225,73 @@ func TestEnsureModel_NoLlamaServerEntryNeeded(t *testing.T) {
 	}
 	if gotVariant != variant {
 		t.Errorf("got variant %q, want %q", gotVariant, variant)
+	}
+}
+
+// Stage tick fires on Ensure* entry so Health flips Phase even when
+// cache hit (or early error) means no byte ticks follow.
+func TestEnsureLlamaServer_ReporterReceivesStageTickOnEntry(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(EnvHome, dir)
+	p, _ := Resolve()
+
+	// platforms empty → LlamaServerForCurrentPlatform errors after the
+	// reporter's entry tick.
+	m := &Manifest{
+		Version:   1,
+		Platforms: map[string]PlatformArtifacts{},
+		Models:    map[string]ArtifactSpec{},
+	}
+
+	var stages []string
+	reporter := func(stage string, _, _ int64) {
+		stages = append(stages, stage)
+	}
+	_, _ = EnsureLlamaServer(t.Context(), p, m, slog.Default(), reporter)
+	if len(stages) != 1 || stages[0] != "llama_server" {
+		t.Errorf("stages = %v, want [llama_server]", stages)
+	}
+}
+
+func TestEnsureModel_ReporterReceivesStageTickOnEntry(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(EnvHome, dir)
+	t.Setenv(EnvModelVariant, "")
+	p, _ := Resolve()
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatalf("EnsureDirs: %v", err)
+	}
+
+	// Pre-populate model so cache-hit returns without any download path
+	// running. Only the entry tick should reach the reporter.
+	variant := "test-variant"
+	body := []byte("model-content")
+	sum := sha256.Sum256(body)
+	wantSHA := hex.EncodeToString(sum[:])
+	modelPath := p.ModelPath(variant)
+	if err := os.MkdirAll(filepath.Dir(modelPath), 0o700); err != nil {
+		t.Fatalf("mkdir models: %v", err)
+	}
+	if err := os.WriteFile(modelPath, body, 0o600); err != nil {
+		t.Fatalf("write model: %v", err)
+	}
+
+	m := &Manifest{
+		Version: 1,
+		Models: map[string]ArtifactSpec{
+			variant: {URL: "https://ignored", SHA256: wantSHA, Size: int64(len(body))},
+		},
+		DefaultModel: variant,
+	}
+
+	var stages []string
+	reporter := func(stage string, _, _ int64) {
+		stages = append(stages, stage)
+	}
+	if _, _, err := EnsureModel(t.Context(), p, m, slog.Default(), reporter); err != nil {
+		t.Fatalf("EnsureModel: %v", err)
+	}
+	if len(stages) != 1 || stages[0] != "model" {
+		t.Errorf("stages = %v, want [model]", stages)
 	}
 }
