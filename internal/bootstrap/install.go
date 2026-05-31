@@ -93,6 +93,18 @@ func EnsureAll(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger, 
 	if err != nil {
 		return "", "", "", err
 	}
+
+	// Audit installation
+	llamaSpec, _ := m.LlamaServerForCurrentPlatform()
+	modelSpec, _ := m.ModelSpec(variant)
+	auditArtifacts := map[string]InstalledArtifact{
+		AuditArtifactLlamaServer: {URL: llamaSpec.URL, SHA256: llamaSpec.SHA256, Path: llamaBin, Size: statSize(llamaBin, llamaSpec.Size)},
+		AuditArtifactModel:       {URL: modelSpec.URL, SHA256: modelSpec.SHA256, Path: modelPath, Size: statSize(modelPath, modelSpec.Size)},
+	}
+	if auditErr := recordInstall(p, ResolveManifestURL(), m.Version, variant, auditArtifacts); auditErr != nil {
+		logger.Warn("audit: installed.json write failed", "err", auditErr)
+	}
+
 	return llamaBin, modelPath, variant, nil
 }
 
@@ -114,7 +126,20 @@ func EnsureLlamaServer(ctx context.Context, p *Paths, m *Manifest, logger *slog.
 		return "", fmt.Errorf("install lock: %w", err)
 	}
 	defer lock.Release()
-	return ensureLlamaServer(ctx, p, m, logger, reporter)
+
+	llamaBin, err := ensureLlamaServer(ctx, p, m, logger, reporter)
+	if err != nil {
+		return "", err
+	}
+
+	llamaSpec, _ := m.LlamaServerForCurrentPlatform()
+	if auditErr := recordInstall(p, ResolveManifestURL(), m.Version, "", map[string]InstalledArtifact{
+		AuditArtifactLlamaServer: {URL: llamaSpec.URL, SHA256: llamaSpec.SHA256, Path: llamaBin, Size: statSize(llamaBin, llamaSpec.Size)},
+	}); auditErr != nil {
+		logger.Warn("audit: installed.json write failed", "err", auditErr)
+	}
+
+	return llamaBin, nil
 }
 
 // EnsureModel ensures the model GGUF is installed. Skips
@@ -149,6 +174,14 @@ func EnsureModel(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger
 	if err != nil {
 		return "", "", err
 	}
+
+	modelSpec, _ := m.ModelSpec(variant)
+	if auditErr := recordInstall(p, ResolveManifestURL(), m.Version, variant, map[string]InstalledArtifact{
+		AuditArtifactModel: {URL: modelSpec.URL, SHA256: modelSpec.SHA256, Path: modelPath, Size: statSize(modelPath, modelSpec.Size)},
+	}); auditErr != nil {
+		logger.Warn("audit: installed.json write failed (non-fatal)", "err", auditErr)
+	}
+
 	return modelPath, variant, nil
 }
 
