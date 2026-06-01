@@ -23,7 +23,7 @@ type InstalledManifest struct {
 }
 
 type InstalledArtifact struct {
-	// Tarbar info
+	// Tarball info
 	URL    string `json:"url"`
 	SHA256 string `json:"sha256"`
 
