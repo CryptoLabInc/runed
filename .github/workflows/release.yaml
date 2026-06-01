@@ -135,6 +135,7 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           VERSION: ${{ steps.meta.outputs.version }}
+          DEFAULT_MANIFEST_URL: https://github.com/${{ github.repository }}/releases/download/${{ steps.meta.outputs.version }}/manifest.json
         run: make build
 
       - name: Package tarball
@@ -183,6 +184,36 @@ jobs:
         id: meta
         run: echo "version=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
 
+      - name: Generate manifest
+        working-directory: dist/
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          MODEL_FILE=$(awk '/^file:/   {print $2}' "${GITHUB_WORKSPACE}/.embedding-model.yaml")
+          MODEL_SHA=$(awk  '/^sha256:/ {print $2}' "${GITHUB_WORKSPACE}/.embedding-model.yaml")
+          MODEL_URL=$(awk  '/^url:/    {print $2}' "${GITHUB_WORKSPACE}/.embedding-model.yaml")
+          MODEL_VARIANT=$(printf %s "${MODEL_FILE}" | sed 's/\.gguf$//' | tr '[:upper:]' '[:lower:]')
+
+          cat > manifest.json <<EOF
+          {
+            "version": 1,
+            "models": {
+              "${MODEL_VARIANT}": {
+                "url":    "${MODEL_URL}",
+                "sha256": "${MODEL_SHA}"
+              }
+            },
+            "default_model": "${MODEL_VARIANT}"
+          }
+          EOF
+
+          # Validate JSON
+          jq . manifest.json > /dev/null
+          cat manifest.json
+
       - name: Create release and upload assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -193,4 +224,4 @@ jobs:
             --title "${{ steps.meta.outputs.version }}" \
             --generate-notes \
             --prerelease \
-            *.tar.gz *.zip *.sha256
+            manifest.json *.tar.gz *.zip *.sha256
