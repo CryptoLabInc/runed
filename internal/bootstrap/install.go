@@ -56,7 +56,7 @@ type StatusReporter func(stage string, bytesDone, bytesTotal int64)
 // side isn't redownloaded only to be discarded.
 //
 // logger may be nil (slog.Default used). reporter may be nil.
-func EnsureAll(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger, reporter StatusReporter) (llamaBin, modelPath, variant string, err error) {
+func EnsureAll(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger, reporter StatusReporter) (llamaBinPath, modelPath, variant string, err error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -82,30 +82,28 @@ func EnsureAll(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger, 
 	}
 	defer lock.Release()
 
-	llamaBin, err = ensureLlamaServer(ctx, p, m, logger, reporter)
+	llamaBinPath, llamaSpec, err := ensureLlamaServer(ctx, p, m, logger, reporter)
 	if err != nil {
 		return "", "", "", err
 	}
 	if reporter != nil {
 		reporter("model", 0, 0)
 	}
-	modelPath, err = ensureModel(ctx, p, m, variant, logger, reporter)
+	modelPath, modelSpec, err := ensureModel(ctx, p, m, variant, logger, reporter)
 	if err != nil {
 		return "", "", "", err
 	}
 
 	// Audit installation
-	llamaSpec, _ := m.LlamaServerForCurrentPlatform()
-	modelSpec, _ := m.ModelSpec(variant)
 	auditArtifacts := map[string]InstalledArtifact{
-		AuditArtifactLlamaServer: {URL: llamaSpec.URL, SHA256: llamaSpec.SHA256, Path: llamaBin, Size: statSize(llamaBin, llamaSpec.Size)},
+		AuditArtifactLlamaServer: {URL: llamaSpec.URL, SHA256: llamaSpec.SHA256, Path: llamaBinPath, Size: statSize(llamaBinPath, llamaSpec.Size)},
 		AuditArtifactModel:       {URL: modelSpec.URL, SHA256: modelSpec.SHA256, Path: modelPath, Size: statSize(modelPath, modelSpec.Size)},
 	}
 	if auditErr := recordInstall(p, ResolveManifestURL(), m.Version, variant, auditArtifacts); auditErr != nil {
 		logger.Warn("audit: installed.json write failed", "err", auditErr)
 	}
 
-	return llamaBin, modelPath, variant, nil
+	return llamaBinPath, modelPath, variant, nil
 }
 
 // EnsureLlamaServer ensures the llama-server binary is installed. The
@@ -127,19 +125,18 @@ func EnsureLlamaServer(ctx context.Context, p *Paths, m *Manifest, logger *slog.
 	}
 	defer lock.Release()
 
-	llamaBin, err := ensureLlamaServer(ctx, p, m, logger, reporter)
+	llamaBinPath, llamaSpec, err := ensureLlamaServer(ctx, p, m, logger, reporter)
 	if err != nil {
 		return "", err
 	}
 
-	llamaSpec, _ := m.LlamaServerForCurrentPlatform()
 	if auditErr := recordInstall(p, ResolveManifestURL(), m.Version, "", map[string]InstalledArtifact{
-		AuditArtifactLlamaServer: {URL: llamaSpec.URL, SHA256: llamaSpec.SHA256, Path: llamaBin, Size: statSize(llamaBin, llamaSpec.Size)},
+		AuditArtifactLlamaServer: {URL: llamaSpec.URL, SHA256: llamaSpec.SHA256, Path: llamaBinPath, Size: statSize(llamaBinPath, llamaSpec.Size)},
 	}); auditErr != nil {
 		logger.Warn("audit: installed.json write failed", "err", auditErr)
 	}
 
-	return llamaBin, nil
+	return llamaBinPath, nil
 }
 
 // EnsureModel ensures the model GGUF is installed. Skips
@@ -170,12 +167,11 @@ func EnsureModel(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger
 	}
 	defer lock.Release()
 
-	modelPath, err = ensureModel(ctx, p, m, variant, logger, reporter)
+	modelPath, modelSpec, err := ensureModel(ctx, p, m, variant, logger, reporter)
 	if err != nil {
 		return "", "", err
 	}
 
-	modelSpec, _ := m.ModelSpec(variant)
 	if auditErr := recordInstall(p, ResolveManifestURL(), m.Version, variant, map[string]InstalledArtifact{
 		AuditArtifactModel: {URL: modelSpec.URL, SHA256: modelSpec.SHA256, Path: modelPath, Size: statSize(modelPath, modelSpec.Size)},
 	}); auditErr != nil {
@@ -270,15 +266,15 @@ func ResolveModelVariant(p *Paths, m *Manifest) (string, error) {
 	return "", errors.New("model variant not specified: set RUNED_MODEL_VARIANT, config.model_variant, or manifest.default_model")
 }
 
-// ensureLlamaServer returns the path to the llama-server executable,
+// ensureLlamaServer returns the path to the llama-server executable and manifest spec,
 // extracting or downloading the artifact as needed. A sidecar marker
 // file (.llama_server.sha256) tracks the last-installed tarball hash so
 // repeat boots don't re-extract.
-func ensureLlamaServer(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger, reporter StatusReporter) (string, error) {
+func ensureLlamaServer(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger, reporter StatusReporter) (string, *LlamaServerSpec, error) {
 	// Caller emits the stage tick before AcquireLock.
 	spec, err := m.LlamaServerForCurrentPlatform()
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	target := llamaServerTarget(p, spec)
 	logger.Info("ensure llama_server: target",
@@ -294,7 +290,7 @@ func ensureLlamaServer(ctx context.Context, p *Paths, m *Manifest, logger *slog.
 		if _, serr := os.Stat(target); serr == nil {
 			logger.Info("ensure llama_server: cache hit, skipping download",
 				"marker", marker)
-			return target, nil
+			return target, spec, nil
 		}
 		logger.Info("ensure llama_server: marker matches but target missing, redoing install",
 			"target", target)
@@ -304,14 +300,16 @@ func ensureLlamaServer(ctx context.Context, p *Paths, m *Manifest, logger *slog.
 	switch spec.Extract {
 	case "":
 		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-			return "", fmt.Errorf("ensure llama_server: mkdir: %w", err)
+			return "", nil, fmt.Errorf("ensure llama_server: mkdir: %w", err)
 		}
+
 		logger.Info("ensure llama_server: downloading raw binary", "url", spec.URL)
+
 		if err := downloadWithRetry(ctx, spec.URL, spec.SHA256, spec.Size, target, progress, logger, "llama_server"); err != nil {
-			return "", fmt.Errorf("ensure llama_server: download: %w", err)
+			return "", nil, fmt.Errorf("ensure llama_server: download: %w", err)
 		}
 		if err := os.Chmod(target, 0o755); err != nil {
-			return "", fmt.Errorf("ensure llama_server: chmod: %w", err)
+			return "", nil, fmt.Errorf("ensure llama_server: chmod: %w", err)
 		}
 	case "tar.gz":
 		tarPath := filepath.Join(p.Cache, "llama-server.tar.gz")
@@ -319,29 +317,29 @@ func ensureLlamaServer(ctx context.Context, p *Paths, m *Manifest, logger *slog.
 			"url", spec.URL,
 			"cache", tarPath)
 		if err := downloadWithRetry(ctx, spec.URL, spec.SHA256, spec.Size, tarPath, progress, logger, "llama_server"); err != nil {
-			return "", fmt.Errorf("ensure llama_server: download: %w", err)
+			return "", nil, fmt.Errorf("ensure llama_server: download: %w", err)
 		}
 		defer os.Remove(tarPath)
 		logger.Info("ensure llama_server: extracting tarball", "dest", p.LlamaDir)
 		extracted, err := ExtractTarGz(tarPath, p.LlamaDir)
 		if err != nil {
-			return "", fmt.Errorf("ensure llama_server: extract: %w", err)
+			return "", nil, fmt.Errorf("ensure llama_server: extract: %w", err)
 		}
 		logger.Info("ensure llama_server: extracted", "files", len(extracted))
 	default:
-		return "", fmt.Errorf("manifest: unsupported extract type %q", spec.Extract)
+		return "", nil, fmt.Errorf("manifest: unsupported extract type %q", spec.Extract)
 	}
 
 	if _, err := os.Stat(target); err != nil {
-		return "", fmt.Errorf("ensure llama_server: exec missing after install: %s: %w", target, err)
+		return "", nil, fmt.Errorf("ensure llama_server: exec missing after install: %s: %w", target, err)
 	}
 	if err := os.Chmod(target, 0o755); err != nil {
-		return "", fmt.Errorf("ensure llama_server: chmod target: %w", err)
+		return "", nil, fmt.Errorf("ensure llama_server: chmod target: %w", err)
 	}
 	// Marker write is an optimization; tolerate failure (we'll just re-extract next boot).
 	_ = os.WriteFile(marker, []byte(spec.SHA256), 0o600)
 	logger.Info("ensure llama_server: install complete", "target", target)
-	return target, nil
+	return target, spec, nil
 }
 
 // llamaServerTarget computes the on-disk path of the executable after
@@ -355,11 +353,12 @@ func llamaServerTarget(p *Paths, spec *LlamaServerSpec) string {
 	return filepath.Join(p.LlamaDir, filepath.FromSlash(exec))
 }
 
-func ensureModel(ctx context.Context, p *Paths, m *Manifest, variant string, logger *slog.Logger, reporter StatusReporter) (string, error) {
+// Return model path and manifest spec, downloading artifact if not exist
+func ensureModel(ctx context.Context, p *Paths, m *Manifest, variant string, logger *slog.Logger, reporter StatusReporter) (string, ArtifactSpec, error) {
 	// Caller emits the stage tick before invoking us.
 	spec, err := m.ModelSpec(variant)
 	if err != nil {
-		return "", err
+		return "", ArtifactSpec{}, err
 	}
 	target := p.ModelPath(variant)
 	logger.Info("ensure model: target",
@@ -370,20 +369,22 @@ func ensureModel(ctx context.Context, p *Paths, m *Manifest, variant string, log
 
 	ok, err := FileMatchesSHA256(target, spec.SHA256)
 	if err != nil {
-		return "", fmt.Errorf("ensure model: hash existing: %w", err)
+		return "", ArtifactSpec{}, fmt.Errorf("ensure model: hash existing: %w", err)
 	}
 	if ok {
 		logger.Info("ensure model: cache hit, skipping download")
-		return target, nil
+		return target, spec, nil
 	}
 	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-		return "", err
+		return "", ArtifactSpec{}, err
 	}
+
 	logger.Info("ensure model: downloading GGUF", "url", spec.URL)
 	progress := makeProgress(logger, reporter, "model", spec.Size)
 	if err := downloadWithRetry(ctx, spec.URL, spec.SHA256, spec.Size, target, progress, logger, "model"); err != nil {
-		return "", fmt.Errorf("ensure model: download: %w", err)
+		return "", ArtifactSpec{}, fmt.Errorf("ensure model: download: %w", err)
 	}
 	logger.Info("ensure model: install complete", "target", target)
-	return target, nil
+
+	return target, spec, nil
 }
