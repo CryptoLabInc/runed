@@ -29,6 +29,7 @@ const (
 	HealthResponse_STATUS_LOADING       HealthResponse_Status = 2 // bootstrap: fetching llama-server, downloading embedding model
 	HealthResponse_STATUS_DEGRADED      HealthResponse_Status = 3
 	HealthResponse_STATUS_SHUTTING_DOWN HealthResponse_Status = 4
+	HealthResponse_STATUS_IDLE          HealthResponse_Status = 5 // backend intentionally suspended after idle to free memory; resumes on next request
 )
 
 // Enum value maps for HealthResponse_Status.
@@ -39,6 +40,7 @@ var (
 		2: "STATUS_LOADING",
 		3: "STATUS_DEGRADED",
 		4: "STATUS_SHUTTING_DOWN",
+		5: "STATUS_IDLE",
 	}
 	HealthResponse_Status_value = map[string]int32{
 		"STATUS_UNSPECIFIED":   0,
@@ -46,6 +48,7 @@ var (
 		"STATUS_LOADING":       2,
 		"STATUS_DEGRADED":      3,
 		"STATUS_SHUTTING_DOWN": 4,
+		"STATUS_IDLE":          5,
 	}
 )
 
@@ -678,7 +681,7 @@ const file_runed_v1_runed_proto_rawDesc = "" +
 	"vector_dim\x18\x03 \x01(\x05R\tvectorDim\x12&\n" +
 	"\x0fmax_text_length\x18\x04 \x01(\x05R\rmaxTextLength\x12$\n" +
 	"\x0emax_batch_size\x18\x05 \x01(\x05R\fmaxBatchSize\"\x0f\n" +
-	"\rHealthRequest\"\x97\x04\n" +
+	"\rHealthRequest\"\xa9\x04\n" +
 	"\x0eHealthResponse\x127\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x1f.runed.v1.HealthResponse.StatusR\x06status\x12%\n" +
 	"\x0euptime_seconds\x18\x02 \x01(\x03R\ruptimeSeconds\x12%\n" +
@@ -688,13 +691,14 @@ const file_runed_v1_runed_proto_rawDesc = "" +
 	"bytes_done\x18\x05 \x01(\x03R\tbytesDone\x12\x1f\n" +
 	"\vbytes_total\x18\x06 \x01(\x03R\n" +
 	"bytesTotal\x12\x18\n" +
-	"\amessage\x18\a \x01(\tR\amessage\"r\n" +
+	"\amessage\x18\a \x01(\tR\amessage\"\x83\x01\n" +
 	"\x06Status\x12\x16\n" +
 	"\x12STATUS_UNSPECIFIED\x10\x00\x12\r\n" +
 	"\tSTATUS_OK\x10\x01\x12\x12\n" +
 	"\x0eSTATUS_LOADING\x10\x02\x12\x13\n" +
 	"\x0fSTATUS_DEGRADED\x10\x03\x12\x18\n" +
-	"\x14STATUS_SHUTTING_DOWN\x10\x04\"z\n" +
+	"\x14STATUS_SHUTTING_DOWN\x10\x04\x12\x0f\n" +
+	"\vSTATUS_IDLE\x10\x05\"z\n" +
 	"\x05Phase\x12\x15\n" +
 	"\x11PHASE_UNSPECIFIED\x10\x00\x12\x1f\n" +
 	"\x1bPHASE_FETCHING_LLAMA_SERVER\x10\x01\x12\x18\n" +

@@ -250,7 +250,7 @@ func (s *Server) Info(ctx context.Context, _ *runedv1.InfoRequest) (*runedv1.Inf
 }
 
 // Health maps backend state to the proto Status enum. SHUTTING_DOWN
-// outranks LOADING/DEGRADED/OK so a drain-in-progress daemon doesn't
+// outranks LOADING/IDLE/DEGRADED/OK so a drain-in-progress daemon doesn't
 // advertise itself as ready (the GracefulStop race would otherwise
 // surface Unavailable right after the OK response).
 //
@@ -278,11 +278,15 @@ func (s *Server) Health(ctx context.Context, _ *runedv1.HealthRequest) (*runedv1
 		}
 		return resp, nil
 	}
-	if !b.IsHealthy(ctx) {
+	switch b.Serving(ctx) {
+	case backend.ServingIdle:
+		resp.Status = runedv1.HealthResponse_STATUS_IDLE
+		resp.Message = "embedder suspended after idle to free memory; the next request resumes it automatically"
+	case backend.ServingDegraded:
 		resp.Status = runedv1.HealthResponse_STATUS_DEGRADED
-		return resp, nil
+	default:
+		resp.Status = runedv1.HealthResponse_STATUS_OK
 	}
-	resp.Status = runedv1.HealthResponse_STATUS_OK
 	return resp, nil
 }
 
