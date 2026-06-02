@@ -34,23 +34,10 @@ jobs:
       matrix:
         include:
           # Full-stack tarballs: runed + rundemo + llama-server.
-          - runner: macos-14
-            goos: darwin
-            goarch: arm64
-            kind: tarball
-          - runner: ubuntu-latest
-            goos: linux
-            goarch: amd64
-            kind: tarball
-          - runner: ubuntu-24.04-arm
-            goos: linux
-            goarch: arm64
-            kind: tarball
-          # Windows: llama-server.exe only zip (runed Windows support deferred).
-          - runner: windows-latest
-            goos: windows
-            goarch: amd64
-            kind: llama-only
+          # (Windows support is dropped for now — no Windows target here.)
+          - { runner: macos-14,         goos: darwin, goarch: arm64 }
+          - { runner: ubuntu-22.04,     goos: linux,  goarch: amd64 }
+          - { runner: ubuntu-22.04-arm, goos: linux,  goarch: arm64 }
 
     steps:
       - uses: actions/checkout@v4
@@ -73,25 +60,40 @@ jobs:
           name: llama-server-${{ matrix.goos }}-${{ matrix.goarch }}
           path: bin/
 
-      - name: Ensure llama-server executable (unix)
-        if: matrix.kind == 'tarball'
+      - name: Ensure llama-server executable
         shell: bash
         run: chmod +x bin/llama-server
 
-      # ─── Smoke gate before packaging (tarball matrix only) ──────────
+      # Build OS label (ubuntu-2204 / mac-14) for the release asset name, read
+      # from the running image so it reflects the actual build baseline/glibc.
+      - name: Resolve build OS label
+        id: osinfo
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${RUNNER_OS}" in
+            Linux)
+              . /etc/os-release
+              echo "label=${ID}-${VERSION_ID//./}" >> "$GITHUB_OUTPUT"          # ubuntu-2204
+              ;;
+            macOS)
+              echo "label=mac-$(sw_vers -productVersion | cut -d. -f1)" >> "$GITHUB_OUTPUT"  # mac-14
+              ;;
+            *)
+              echo "::error::unhandled RUNNER_OS=${RUNNER_OS}" >&2; exit 1 ;;
+          esac
+
+      # ─── Smoke gate before packaging ────────────────────────────────
       - uses: actions/setup-go@v5
-        if: matrix.kind == 'tarball'
         with:
           go-version-file: go.mod
           check-latest: true
 
       - uses: bufbuild/buf-setup-action@v1
-        if: matrix.kind == 'tarball'
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Read embedding model pin
-        if: matrix.kind == 'tarball'
         id: model
         shell: bash
         run: |
@@ -100,14 +102,12 @@ jobs:
           echo "file=$(awk '/^file:/ {print $2}' .embedding-model.yaml)"     >> "$GITHUB_OUTPUT"
 
       - name: Cache embedding model
-        if: matrix.kind == 'tarball'
         uses: actions/cache@v4
         with:
           path: models
           key: embedding-model-${{ steps.model.outputs.sha256 }}
 
       - name: Fetch embedding model (cache miss only)
-        if: matrix.kind == 'tarball'
         shell: bash
         env:
           FILE: ${{ steps.model.outputs.file }}
@@ -122,7 +122,6 @@ jobs:
           echo "${SHA}  models/${FILE}" | shasum -a 256 -c -
 
       - name: Run integration tests (release gate)
-        if: matrix.kind == 'tarball'
         env:
           RUNED_TEST_LLAMA_SERVER: ${{ github.workspace }}/bin/llama-server
           RUNED_TEST_GGUF:         ${{ github.workspace }}/models/${{ steps.model.outputs.file }}
@@ -130,7 +129,6 @@ jobs:
 
       # ─── Build runed + package tarball ──────────────────────────────
       - name: Build runed binaries
-        if: matrix.kind == 'tarball'
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -139,23 +137,12 @@ jobs:
         run: make build
 
       - name: Package tarball
-        if: matrix.kind == 'tarball'
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          OS_LABEL: ${{ steps.osinfo.outputs.label }}
           VERSION: ${{ steps.meta.outputs.version }}
         run: make release-tarball
-
-      # ─── Windows: llama-server.exe zip ──────────────────────────────
-      - name: Package llama-server zip (windows)
-        if: matrix.kind == 'llama-only'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $name = "llama-server-${{ steps.meta.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}.zip"
-          Compress-Archive -Path bin/llama-server.exe -DestinationPath "dist/$name"
-          $hash = (Get-FileHash "dist/$name" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $name" | Out-File -Encoding ascii "dist/$name.sha256"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -224,4 +211,4 @@ jobs:
             --title "${{ steps.meta.outputs.version }}" \
             --generate-notes \
             --prerelease \
-            manifest.json *.tar.gz *.zip *.sha256
+            manifest.json *.tar.gz *.sha256

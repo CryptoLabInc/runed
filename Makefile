@@ -4,6 +4,11 @@ VERSION ?= v0.1.0-alpha
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
 
+# OS_LABEL names the build OS in the release tarball (e.g. ubuntu-2204, mac-14)
+# so the artifact records its glibc/SDK baseline. CI passes the running image's
+# real identity; local `make release-tarball` falls back to GOOS.
+OS_LABEL ?= $(GOOS)
+
 LLAMA_CPP_REF := $(shell cat .llama-cpp-version)
 LLAMA_CPP_DIR := third_party/llama.cpp
 LLAMA_CPP_CACHE := $(CURDIR)/ci/llama-cpp-cache.cmake
@@ -57,9 +62,8 @@ build: proto
 		-o bin/rundemo ./cmd/rundemo
 
 # Clone (shallow) and CPU-build llama-server at the pinned ref.
-# Unix-only target — Windows CI invokes cmake directly because make/sh aren't
-# the natural toolchain there. Reentrant: skips git clone if the directory
-# already exists at the right ref, and skips cmake if the binary is fresh.
+# Reentrant: skips git clone if the directory already exists at the right ref,
+# and skips cmake if the binary is fresh.
 llama-server:
 	@if [ ! -d "$(LLAMA_CPP_DIR)/.git" ]; then \
 		mkdir -p $(dir $(LLAMA_CPP_DIR)); \
@@ -67,8 +71,8 @@ llama-server:
 			https://github.com/ggml-org/llama.cpp $(LLAMA_CPP_DIR); \
 	fi
 	cmake -B $(LLAMA_CPP_DIR)/build -S $(LLAMA_CPP_DIR) -C $(LLAMA_CPP_CACHE) $(LLAMA_CMAKE_EXTRA)
-	# -j2 caps parallel compile jobs: ubuntu-latest (16GB / 4 vCPU) OOM-killed
-	# the build at -j auto. ubuntu-24.04-arm and macos-14 survived but the
+	# -j2 caps parallel compile jobs: ubuntu-22.04 (16GB / 4 vCPU) OOM-killed
+	# the build at -j auto. ubuntu-22.04-arm and macos-14 survived but the
 	# bound is uniform across matrices for predictability.
 	cmake --build $(LLAMA_CPP_DIR)/build --target llama-server -j 2 --config Release
 	mkdir -p bin
@@ -81,11 +85,10 @@ clean:
 	rm -rf bin/ gen/ dist/
 
 # Packages the Go binaries plus llama-server into a single tarball.
-# Assumes `make build` and `make llama-server` (or the workflow's Windows
-# equivalent) have already populated bin/.
+# Assumes `make build` and `make llama-server` have already populated bin/.
 release-tarball:
 	mkdir -p dist
-	TARNAME=runed-$(VERSION)-$(GOOS)-$(GOARCH).tar.gz; \
+	TARNAME=runed-$(VERSION)-$(OS_LABEL)-$(GOARCH).tar.gz; \
 	tar -czf dist/$$TARNAME -C bin runed rundemo llama-server; \
 	cd dist && ( \
 		(command -v shasum >/dev/null 2>&1 && shasum -a 256 $$TARNAME > $$TARNAME.sha256) \
