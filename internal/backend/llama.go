@@ -27,6 +27,32 @@ type Config struct {
 	CtxSize    int    // default 2048; --ctx-size in tokens = max input length (llama-server rejects longer input with HTTP 400)
 }
 
+// ServingState is the backend's current ability to serve embeddings, as
+// reported through the daemon's Health RPC.
+type ServingState int
+
+const (
+	// ServingOK: the llama-server child is up and answering /health.
+	ServingOK ServingState = iota
+	// ServingIdle: the child was intentionally stopped after an idle period
+	// to free model memory. The next Embed RPC resurrects it (a one-off
+	// cold-start latency). This is expected, not a fault.
+	ServingIdle
+	// ServingDegraded: the child is up but failing /health, or it exited
+	// unexpectedly. A genuine problem.
+	ServingDegraded
+)
+
+// childState records why the llama-server child is not currently running,
+// so Serving can tell an intentional idle-suspend apart from a crash.
+type childState int
+
+const (
+	childRunning   childState = iota // child up (or starting)
+	childSuspended                   // intentionally stopped (idle suspend / restart)
+	childFailed                      // exited unexpectedly
+)
+
 type LlamaBackend struct {
 	cfg Config
 
@@ -34,7 +60,10 @@ type LlamaBackend struct {
 	port     int
 	cmdDone  chan struct{} // closed by watchChild when current cmd.Wait returns
 	stopping bool          // true while stopLocked is intentionally terminating the child
-	mu       sync.Mutex    // protects cmd, port, cmdDone, stopping — short critical sections only
+	// state records why the child is down (childSuspended vs childFailed) so
+	// Serving maps it to ServingIdle vs ServingDegraded. Protected by mu.
+	state childState
+	mu    sync.Mutex // protects cmd, port, cmdDone, stopping, state — short critical sections only
 
 	// lifecycleMu serializes Start / Stop / EnsureStarted. RPC handlers
 	// call EnsureStarted on every request so the contention here must
@@ -166,6 +195,7 @@ func (b *LlamaBackend) startLocked(ctx context.Context) error {
 	b.cmd = cmd
 	b.port = 0
 	b.cmdDone = done
+	b.state = childRunning
 	b.mu.Unlock()
 	go b.watchChild(cmd, done)
 
@@ -263,6 +293,11 @@ func (b *LlamaBackend) watchChild(cmd *exec.Cmd, done chan struct{}) {
 	if b.cmd == cmd {
 		b.cmd = nil
 		b.port = 0
+		// Any exit leaves the child down; default to failed so a crash or a
+		// failed (re)start reports DEGRADED. Stop() (the idle-suspend path)
+		// overrides to childSuspended afterward — it waits on done, so its
+		// write lands strictly after this one.
+		b.state = childFailed
 	}
 	b.mu.Unlock()
 	// Log before close(done) so readers of done can rely on the log
@@ -302,6 +337,27 @@ func (b *LlamaBackend) IsHealthy(ctx context.Context) bool {
 	return resp.StatusCode == 200
 }
 
+// Serving reports whether the backend can currently serve embeddings, and if
+// not, why. Health maps the result onto the proto Status enum:
+// ServingOK→OK, ServingIdle→IDLE (intentional idle-suspend, resumes on the
+// next RPC), ServingDegraded→DEGRADED (process up-but-unhealthy, or crashed).
+func (b *LlamaBackend) Serving(ctx context.Context) ServingState {
+	b.mu.Lock()
+	haveCmd := b.cmd != nil
+	st := b.state
+	b.mu.Unlock()
+	if haveCmd {
+		if b.IsHealthy(ctx) {
+			return ServingOK
+		}
+		return ServingDegraded
+	}
+	if st == childSuspended {
+		return ServingIdle
+	}
+	return ServingDegraded
+}
+
 // Stop terminates the llama-server child if running. After Stop returns,
 // cmd is nil and port is 0 — a subsequent EnsureStarted re-launches the
 // child cleanly.
@@ -316,7 +372,22 @@ func (b *LlamaBackend) Stop(ctx context.Context) error {
 	defer b.inflightMu.Unlock()
 	b.lifecycleMu.Lock()
 	defer b.lifecycleMu.Unlock()
-	return b.stopLocked(ctx)
+	b.mu.Lock()
+	wasRunning := b.cmd != nil
+	b.mu.Unlock()
+	err := b.stopLocked(ctx)
+	// Stop is the intentional idle-suspend path (the idle ticker). Mark the
+	// child suspended so Serving reports IDLE, not DEGRADED — but only if we
+	// actually stopped a running child, so a Stop on an already-crashed
+	// backend doesn't mask the failure. stopLocked waits on done, so
+	// watchChild's childFailed write has already landed; this override runs
+	// after it.
+	if wasRunning {
+		b.mu.Lock()
+		b.state = childSuspended
+		b.mu.Unlock()
+	}
+	return err
 }
 
 func (b *LlamaBackend) stopLocked(ctx context.Context) error {

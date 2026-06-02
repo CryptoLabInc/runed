@@ -81,6 +81,7 @@ message HealthResponse {
     STATUS_LOADING = 2; // bootstrap: fetching llama-server, downloading embedding model
     STATUS_DEGRADED = 3;
     STATUS_SHUTTING_DOWN = 4;
+    STATUS_IDLE = 5; // backend intentionally suspended after idle to free memory; resumes on next request
   }
 
   // STATUS_LOADING sub-phase
