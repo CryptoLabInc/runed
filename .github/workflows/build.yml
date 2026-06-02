@@ -23,8 +23,8 @@ jobs:
       matrix:
         include:
           - { runner: macos-14,         goos: darwin, goarch: arm64, smoke: true }
-          - { runner: ubuntu-latest,    goos: linux,  goarch: amd64, smoke: true }
-          - { runner: ubuntu-24.04-arm, goos: linux,  goarch: arm64, smoke: true }
+          - { runner: ubuntu-22.04,     goos: linux,  goarch: amd64, smoke: true }
+          - { runner: ubuntu-22.04-arm, goos: linux,  goarch: arm64, smoke: true }
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
