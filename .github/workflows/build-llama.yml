@@ -1,6 +1,7 @@
 name: build-llama
 
-# Vendor prebuild: builds llama-server for every supported platform,
+# Vendor prebuild: builds llama-server for every supported platform
+# (linux amd64/arm64 + darwin arm64; Windows support is dropped for now),
 # publishes the binary to GHCR (when permissions allow), and emits an
 # actions/upload-artifact so callers via workflow_call can consume the
 # binary without going through GHCR. build.yml and release.yaml call
@@ -17,7 +18,11 @@ name: build-llama
 #   - push to main on the same paths: build AND push to GHCR.
 #
 # Artifacts:
-#   GHCR: ghcr.io/<repo-lowercase>/llama-server:<llama-cpp-ref>-<os>-<arch>
+#   GHCR: ghcr.io/<repo-lowercase>/llama-server:<ref>-<os-type>-<os-version>-<arch>
+#         e.g. ...-ubuntu-2204-amd64 / ...-mac-14-arm64.
+#         OS type+version are read from the running image (not the runner
+#         label, which can be a rolling alias), so an OS/glibc bump busts the
+#         cache and triggers a fresh build.
 #   Workflow artifact: llama-server-<os>-<arch> containing the binary.
 
 on:
@@ -61,10 +66,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: macos-14,         os: darwin,  arch: arm64, kind: unix    }
-          - { runner: ubuntu-22.04,     os: linux,   arch: amd64, kind: unix    }
-          - { runner: ubuntu-22.04-arm, os: linux,   arch: arm64, kind: unix    }
-          - { runner: windows-latest,   os: windows, arch: amd64, kind: windows }
+          - { runner: macos-14,         os: darwin, arch: arm64 }
+          - { runner: ubuntu-22.04,     os: linux,  arch: amd64 }
+          - { runner: ubuntu-22.04-arm, os: linux,  arch: arm64 }
 
     steps:
       - uses: actions/checkout@v4
@@ -83,8 +87,35 @@ jobs:
         id: tag
         shell: bash
         run: |
+          set -euo pipefail
           ref_repo=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          echo "tag=ghcr.io/${ref_repo}/llama-server:${{ steps.ref.outputs.ref }}-${{ matrix.os }}-${{ matrix.arch }}" >> "$GITHUB_OUTPUT"
+          # Tag layout: <ref>-<os-type>-<os-version>-<arch>, e.g.
+          #   b9352-ubuntu-2204-amd64 / b9352-mac-14-arm64
+          # OS type+version are read from the running image (not the runner
+          # label, which can be a rolling alias like ubuntu-latest) so the
+          # build baseline — most importantly the linux glibc version — is part
+          # of the cache key. An OS bump then busts the cache and forces a
+          # fresh build instead of reusing a binary built against another glibc.
+          case "${RUNNER_OS}" in
+            Linux)
+              . /etc/os-release
+              os_type="${ID}"                 # ubuntu
+              os_version="${VERSION_ID//./}"  # 22.04 -> 2204
+              ;;
+            macOS)
+              os_type="mac"
+              os_version="$(sw_vers -productVersion | cut -d. -f1)"  # 14
+              ;;
+            *)
+              echo "::error::unhandled RUNNER_OS=${RUNNER_OS}" >&2
+              exit 1
+              ;;
+          esac
+          if [ -z "${os_type:-}" ] || [ -z "${os_version:-}" ]; then
+            echo "::error::could not resolve OS type/version for the tag (RUNNER_OS=${RUNNER_OS})" >&2
+            exit 1
+          fi
+          echo "tag=ghcr.io/${ref_repo}/llama-server:${{ steps.ref.outputs.ref }}-${os_type}-${os_version}-${{ matrix.arch }}" >> "$GITHUB_OUTPUT"
 
       # ─── GHCR login + existence check ─────────────────────────────────
       - name: Install oras
@@ -128,7 +159,7 @@ jobs:
 
       # ─── Path 1: Pull existing binary from GHCR ─────────────────────────
       - name: Pull llama-server from GHCR
-        if: steps.plan.outputs.skip_build == 'true' && matrix.kind == 'unix'
+        if: steps.plan.outputs.skip_build == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -137,59 +168,24 @@ jobs:
           chmod +x bin/llama-server
           bin/llama-server --version
 
-      - name: Pull llama-server.exe from GHCR
-        if: steps.plan.outputs.skip_build == 'true' && matrix.kind == 'windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path bin | Out-Null
-          oras pull --output bin "${{ steps.tag.outputs.tag }}"
-
       # ─── Path 2: Build llama-server fresh ─────────────────────────────
-      - name: Clone llama.cpp (windows)
-        if: steps.plan.outputs.skip_build != 'true' && matrix.kind == 'windows'
-        shell: bash
-        run: |
-          mkdir -p third_party
-          git clone --depth 1 --branch ${{ steps.ref.outputs.ref }} \
-            https://github.com/ggml-org/llama.cpp third_party/llama.cpp
-
-      - name: Build llama-server (unix)
-        if: steps.plan.outputs.skip_build != 'true' && matrix.kind == 'unix'
+      - name: Build llama-server
+        if: steps.plan.outputs.skip_build != 'true'
         run: make llama-server
 
-      - name: Build llama-server.exe (windows)
-        if: steps.plan.outputs.skip_build != 'true' && matrix.kind == 'windows'
-        shell: pwsh
-        run: |
-          cmake -B third_party/llama.cpp/build -S third_party/llama.cpp -C ci/llama-cpp-cache.cmake
-          # -j 2 caps parallel compile jobs to avoid OOM on 16GB runners.
-          cmake --build third_party/llama.cpp/build --target llama-server -j 2 --config Release
-          New-Item -ItemType Directory -Force -Path bin | Out-Null
-          Copy-Item third_party/llama.cpp/build/bin/Release/llama-server.exe bin/
-
       - name: Sanity check binary
-        if: matrix.kind == 'unix'
         shell: bash
         run: bin/llama-server --version
 
       # ─── GHCR push (only when we built fresh AND we have write perms) ────
-      - name: Push llama-server to GHCR (unix)
-        if: steps.plan.outputs.skip_build != 'true' && github.event_name != 'pull_request' && matrix.kind == 'unix'
+      - name: Push llama-server to GHCR
+        if: steps.plan.outputs.skip_build != 'true' && github.event_name != 'pull_request'
         shell: bash
         working-directory: bin
         run: |
           oras push "${{ steps.tag.outputs.tag }}" \
             --artifact-type "application/vnd.runed.llama-server" \
             llama-server
-
-      - name: Push llama-server.exe to GHCR (windows)
-        if: steps.plan.outputs.skip_build != 'true' && github.event_name != 'pull_request' && matrix.kind == 'windows'
-        shell: pwsh
-        working-directory: bin
-        run: |
-          oras push "${{ steps.tag.outputs.tag }}" `
-            --artifact-type "application/vnd.runed.llama-server" `
-            llama-server.exe
 
       # ─── Workflow artifact (always — consumed by build.yml / release.yaml) ─
       - name: Upload llama-server artifact
