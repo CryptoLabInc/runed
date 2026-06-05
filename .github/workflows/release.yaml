@@ -202,13 +202,14 @@ jobs:
           cat manifest.json
 
       - name: Create release and upload assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        working-directory: dist/
-        run: |
-          gh release create "${{ steps.meta.outputs.version }}" \
-            --repo "${{ github.repository }}" \
-            --title "${{ steps.meta.outputs.version }}" \
-            --generate-notes \
-            --prerelease \
-            manifest.json *.tar.gz *.sha256
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.meta.outputs.version }}
+          name: ${{ steps.meta.outputs.version }}
+          prerelease: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/manifest.json
+            dist/*.tar.gz
+            dist/*.sha256
