@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -106,10 +107,44 @@ func FetchManifest(ctx context.Context) (*Manifest, error) {
 	if url == "" {
 		return nil, ErrManifestURLMissing
 	}
-	return fetchManifestFrom(ctx, url)
+
+	// Only the network fetch is retried (reusing the download retry budget):
+	// a transient GitHub CDN 504 at boot must not hard-fail the daemon, but a
+	// deterministic parse/version error is not worth re-fetching for. ctx
+	// cancellation aborts immediately without burning the remaining attempts.
+	var (
+		body    []byte
+		lastErr error
+	)
+	backoff := downloadRetryBackoff
+	for attempt := 1; attempt <= maxDownloadAttempts; attempt++ {
+		if attempt > 1 {
+			slog.Warn("retrying manifest fetch",
+				"attempt", attempt,
+				"max", maxDownloadAttempts,
+				"after", lastErr,
+				"backoff", backoff.String())
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return nil, fmt.Errorf("manifest fetch retry aborted: %w", ctx.Err())
+			}
+			backoff *= retryBackoffMultiplier
+		}
+		body, lastErr = fetchManifestBody(ctx, url)
+		if lastErr == nil {
+			return parseManifest(body)
+		}
+		if ctx.Err() != nil {
+			return nil, lastErr
+		}
+	}
+	return nil, fmt.Errorf("manifest fetch failed after %d attempts: %w", maxDownloadAttempts, lastErr)
 }
 
-func fetchManifestFrom(ctx context.Context, url string) (*Manifest, error) {
+// fetchManifestBody performs a single manifest GET and returns the raw
+// body. It is the retryable unit wrapped by FetchManifest.
+func fetchManifestBody(ctx context.Context, url string) ([]byte, error) {
 	fctx, cancel := context.WithTimeout(ctx, manifestFetchTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(fctx, http.MethodGet, url, nil)
@@ -131,7 +166,7 @@ func fetchManifestFrom(ctx context.Context, url string) (*Manifest, error) {
 	if int64(len(body)) > manifestMaxBytes {
 		return nil, fmt.Errorf("manifest: body exceeds %d bytes", manifestMaxBytes)
 	}
-	return parseManifest(body)
+	return body, nil
 }
 
 func parseManifest(body []byte) (*Manifest, error) {
