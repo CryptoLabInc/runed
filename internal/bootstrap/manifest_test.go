@@ -6,7 +6,17 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
+
+// fastRetry compresses the retry backoff so tests that exercise the retry
+// path don't sleep for real seconds. It restores the original on cleanup.
+func fastRetry(t *testing.T) {
+	t.Helper()
+	orig := downloadRetryBackoff
+	downloadRetryBackoff = time.Millisecond
+	t.Cleanup(func() { downloadRetryBackoff = orig })
+}
 
 const sampleManifest = `{
   "version": 1,
@@ -145,6 +155,7 @@ func TestFetchManifest_HTTP(t *testing.T) {
 }
 
 func TestFetchManifest_HTTPError(t *testing.T) {
+	fastRetry(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
@@ -154,5 +165,34 @@ func TestFetchManifest_HTTPError(t *testing.T) {
 	_, err := FetchManifest(t.Context())
 	if err == nil || !strings.Contains(err.Error(), "500") {
 		t.Errorf("expected HTTP 500 error, got %v", err)
+	}
+}
+
+// TestFetchManifest_RetriesTransient verifies a transient 5xx (e.g. a
+// GitHub CDN 504) is retried and the fetch ultimately succeeds.
+func TestFetchManifest_RetriesTransient(t *testing.T) {
+	fastRetry(t)
+	var attempts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 3 {
+			http.Error(w, "gateway timeout", http.StatusGatewayTimeout)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(sampleManifest))
+	}))
+	defer srv.Close()
+	t.Setenv(EnvManifest, srv.URL)
+
+	m, err := FetchManifest(t.Context())
+	if err != nil {
+		t.Fatalf("FetchManifest after transient 504s: %v", err)
+	}
+	if m.Version != 1 {
+		t.Errorf("Version = %d, want 1", m.Version)
+	}
+	if attempts != 3 {
+		t.Errorf("attempts = %d, want 3 (two 504s then success)", attempts)
 	}
 }
