@@ -4,12 +4,11 @@ package ipc
 
 import (
 	"errors"
-	"net"
 )
 
 // Listen is not implemented on Windows in Plan A. Named-pipe support lands
 // in Plan B.
-func Listen(path string) (net.Listener, error) {
+func Listen(path string) (Listener, error) {
 	_ = path
 	return nil, errors.New("runed: Windows named pipe not implemented in Plan A")
 }

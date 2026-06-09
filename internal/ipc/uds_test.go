@@ -3,7 +3,6 @@
 package ipc
 
 import (
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -57,9 +56,8 @@ func TestListen_CleansUpStaleSocket(t *testing.T) {
 	}
 	defer lis.Close()
 
-	_, ok := lis.(*net.UnixListener)
-	if !ok {
-		t.Fatalf("expected UnixListener")
+	if !lis.StillOwned() {
+		t.Fatal("freshly bound socket should be owned")
 	}
 }
 
@@ -79,5 +77,68 @@ func TestListen_RejectsLiveSocket(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "already in use") {
 		t.Fatalf("want 'already in use' error, got: %v", err)
+	}
+}
+
+func TestStillOwned_FalseAfterRemove(t *testing.T) {
+	dir := shortTempDir(t)
+	sockPath := filepath.Join(dir, "embedding.sock")
+
+	lis, err := Listen(sockPath)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer lis.Close()
+
+	if !lis.StillOwned() {
+		t.Fatal("want owned immediately after bind")
+	}
+	if err := os.Remove(sockPath); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if lis.StillOwned() {
+		t.Fatal("want not owned after socket file removed")
+	}
+}
+
+// TestClose_DoesNotRemoveReboundSocket is the Fix-2 regression: an evicted
+// listener closing must not delete the socket file a *different* listener
+// rebound at the same path (Go's default unlink-on-close would).
+func TestClose_DoesNotRemoveReboundSocket(t *testing.T) {
+	dir := shortTempDir(t)
+	sockPath := filepath.Join(dir, "embedding.sock")
+
+	l1, err := Listen(sockPath)
+	if err != nil {
+		t.Fatalf("first Listen: %v", err)
+	}
+
+	// Simulate another daemon rebinding the path after l1's home was wiped:
+	// remove the path (l1 keeps its fd, so its inode is pinned), then bind a
+	// fresh socket with a new inode at the same path.
+	if err := os.Remove(sockPath); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	l2, err := Listen(sockPath)
+	if err != nil {
+		t.Fatalf("second Listen: %v", err)
+	}
+	defer l2.Close()
+
+	if l1.StillOwned() {
+		t.Fatal("l1 should no longer own the rebound path")
+	}
+	if !l2.StillOwned() {
+		t.Fatal("l2 should own the path it just bound")
+	}
+
+	// Closing the evicted l1 must leave l2's socket file intact.
+	_ = l1.Close()
+
+	if _, err := os.Stat(sockPath); err != nil {
+		t.Fatalf("socket path should still exist after evicted l1.Close(): %v", err)
+	}
+	if !l2.StillOwned() {
+		t.Fatal("l1.Close() deleted l2's socket file — unlink-on-close regression")
 	}
 }
