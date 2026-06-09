@@ -45,6 +45,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -74,6 +75,12 @@ func run() error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// evicted is set by the self-eviction watchdog when our socket is taken
+	// over mid-boot. It lets the boot-failure paths below exit 0 (so the
+	// supervisor stays down) instead of reporting the cancelled bootstrap as
+	// a crash that would be restarted into the same stolen path.
+	var evicted atomic.Bool
 
 	paths, err := bootstrap.Resolve()
 	if err != nil {
@@ -138,6 +145,13 @@ func run() error {
 		close(serveErr)
 	}()
 
+	// Self-eviction watchdog: if our socket file is unlinked or rebound by
+	// another daemon (typically after $RUNED_HOME is recreated out from under
+	// us), we can no longer accept new connections even though the process is
+	// otherwise healthy. Detect that and shut down via the normal graceful
+	// path so we don't linger as an orphan holding a dead socket.
+	go watchSocketOwnership(ctx, cancel, &evicted, logger, lis, sockPath, srv)
+
 	// Forward bootstrap progress into Health via stage→Phase mapping.
 	reporter := bootstrap.StatusReporter(func(stage string, done, total int64) {
 		phase, msg := stagePhase(stage)
@@ -154,6 +168,9 @@ func run() error {
 		bin, mp, err := selfBootstrap(ctx, logger, paths, llamaBin == "", model == "", reporter)
 		if err != nil {
 			bailBoot(logger, srv, gs, nil)
+			if evicted.Load() {
+				return nil
+			}
 			return err
 		}
 		if llamaBin == "" {
@@ -172,6 +189,9 @@ func run() error {
 	modelID, err := sha256File(model)
 	if err != nil {
 		bailBoot(logger, srv, gs, nil)
+		if evicted.Load() {
+			return nil
+		}
 		return fmt.Errorf("model hash: %w", err)
 	}
 	logger.Info("model identity", "sha256", modelID, "path", model)
@@ -192,6 +212,9 @@ func run() error {
 		// b.Start may have spawned a child that failed health-probe;
 		// bailBoot's b.Stop reaps it.
 		bailBoot(logger, srv, gs, b)
+		if evicted.Load() {
+			return nil
+		}
 		return fmt.Errorf("backend start: %w", err)
 	}
 	logger.Info("llama-server ready", "port", b.Port())
@@ -202,6 +225,9 @@ func run() error {
 	idleTimeout, err := parseIdleTimeout()
 	if err != nil {
 		bailBoot(logger, srv, gs, b)
+		if evicted.Load() {
+			return nil
+		}
 		return fmt.Errorf("RUNED_IDLE_TIMEOUT: %w", err)
 	}
 	if idleTimeout > 0 {
@@ -412,6 +438,55 @@ func anotherDaemonReachable(ctx context.Context, sockPath string) bool {
 	}
 	conn.Close()
 	return true
+}
+
+// socketOwnershipPoll is how often the self-eviction watchdog checks that
+// runed's socket file still belongs to it.
+const socketOwnershipPoll = 5 * time.Second
+
+// watchSocketOwnership shuts the daemon down (via the normal graceful path)
+// if its socket file is removed or replaced by another daemon's socket. This
+// reaps the orphan that would otherwise result when $RUNED_HOME is wiped or
+// rebound out from under a running daemon: the socket path stops pointing at
+// us, so we no longer receive connections while staying alive and holding a
+// dead socket. Triggering a graceful shutdown (which exits 0) lets the
+// supervisor stay down rather than restart us into the same stolen path.
+//
+// On detection it records the eviction, triggers the normal graceful-shutdown
+// path via TriggerShutdown, and cancels the daemon context so an in-flight
+// self-bootstrap / backend start aborts promptly instead of running to
+// completion first; the eviction flag lets run()'s boot-failure paths exit 0
+// so the supervisor stays down. It also returns on any other shutdown cause
+// (signal, Shutdown RPC, ctx cancel), and re-checks ShutdownCh before logging
+// so a concurrent shutdown is not misreported as an eviction.
+func watchSocketOwnership(ctx context.Context, cancel context.CancelFunc, evicted *atomic.Bool, logger *slog.Logger, lis ipc.Listener, sockPath string, srv *server.Server) {
+	ticker := time.NewTicker(socketOwnershipPoll)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-srv.ShutdownCh():
+			return
+		case <-ticker.C:
+			if lis.StillOwned() {
+				continue
+			}
+			// A concurrent shutdown may have already closed (and unlinked) our
+			// own socket; don't mistake that for an eviction.
+			select {
+			case <-srv.ShutdownCh():
+				return
+			default:
+			}
+			logger.Warn("socket no longer owned by this daemon; self-evicting",
+				"socket", sockPath)
+			evicted.Store(true)
+			srv.TriggerShutdown()
+			cancel()
+			return
+		}
+	}
 }
 
 // sha256File returns a short, prefixed SHA-256 identifier of the file at path.
