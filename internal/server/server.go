@@ -14,6 +14,7 @@ import (
 
 	runedv1 "github.com/CryptoLabInc/runed/gen/runed/v1"
 	"github.com/CryptoLabInc/runed/internal/backend"
+	"github.com/CryptoLabInc/runed/internal/route"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -58,6 +59,13 @@ type Server struct {
 
 	// nil before any SetBootstrapStatus call.
 	bootstrapStatus atomic.Pointer[bootstrapState]
+
+	// centroids is the IVF set pushed via SetCentroids (or loaded from the
+	// disk cache at boot); nil until then, making with_route requests fail
+	// with FAILED_PRECONDITION. centroidCacheDir is where a newly pushed set
+	// is persisted (empty = no persistence, used by tests).
+	centroids        atomic.Pointer[route.CentroidSet]
+	centroidCacheDir string
 
 	// Embed + EmbedBatch counter. Surfaced via HealthResponse.total_requests.
 	requests atomic.Int64
@@ -190,6 +198,12 @@ func (s *Server) Embed(ctx context.Context, req *runedv1.EmbedRequest) (*runedv1
 	if b == nil {
 		return nil, status.Error(codes.FailedPrecondition, "daemon is bootstrapping; embed not yet available")
 	}
+	// Fail before the forward pass: routing without a centroid set can never
+	// succeed, and the caller (rune-mcp) reacts by pushing SetCentroids first.
+	cs := s.centroids.Load()
+	if req.WithRoute && cs == nil {
+		return nil, status.Error(codes.FailedPrecondition, "no centroid set loaded; push one via SetCentroids before requesting with_route")
+	}
 	s.requests.Add(1)
 	for attempt := 0; attempt < embedMaxAttempts; attempt++ {
 		if err := b.EnsureStarted(); err != nil {
@@ -197,7 +211,12 @@ func (s *Server) Embed(ctx context.Context, req *runedv1.EmbedRequest) (*runedv1
 		}
 		vec, err := b.Embed(ctx, req.Text, true)
 		if err == nil {
-			return &runedv1.EmbedResponse{Vector: vec}, nil
+			resp := &runedv1.EmbedResponse{Vector: vec}
+			if req.WithRoute {
+				resp.ClusterId = cs.Assign(vec)
+				resp.CentroidSetVersion = cs.Version
+			}
+			return resp, nil
 		}
 		if !errors.Is(err, backend.ErrNotStarted) {
 			return nil, err
@@ -213,6 +232,10 @@ func (s *Server) EmbedBatch(ctx context.Context, req *runedv1.EmbedBatchRequest)
 	if b == nil {
 		return nil, status.Error(codes.FailedPrecondition, "daemon is bootstrapping; embed not yet available")
 	}
+	cs := s.centroids.Load()
+	if req.WithRoute && cs == nil {
+		return nil, status.Error(codes.FailedPrecondition, "no centroid set loaded; push one via SetCentroids before requesting with_route")
+	}
 	s.requests.Add(1)
 	for attempt := 0; attempt < embedMaxAttempts; attempt++ {
 		if err := b.EnsureStarted(); err != nil {
@@ -225,6 +248,10 @@ func (s *Server) EmbedBatch(ctx context.Context, req *runedv1.EmbedBatchRequest)
 			}
 			for i, v := range vecs {
 				out.Embeddings[i] = &runedv1.EmbedResponse{Vector: v}
+				if req.WithRoute {
+					out.Embeddings[i].ClusterId = cs.Assign(v)
+					out.Embeddings[i].CentroidSetVersion = cs.Version
+				}
 			}
 			return out, nil
 		}
@@ -240,13 +267,17 @@ func (s *Server) EmbedBatch(ctx context.Context, req *runedv1.EmbedBatchRequest)
 // Health reports STATUS_OK.
 func (s *Server) Info(ctx context.Context, _ *runedv1.InfoRequest) (*runedv1.InfoResponse, error) {
 	mid, _ := s.modelIdentity.Load().(string)
-	return &runedv1.InfoResponse{
+	info := &runedv1.InfoResponse{
 		DaemonVersion: s.version,
 		ModelIdentity: mid,
 		VectorDim:     vectorDim,
 		MaxTextLength: s.maxTextLength.Load(),
 		MaxBatchSize:  maxBatchSize,
-	}, nil
+	}
+	if cs := s.centroids.Load(); cs != nil {
+		info.CentroidSetVersion = cs.Version
+	}
+	return info, nil
 }
 
 // Health maps backend state to the proto Status enum. SHUTTING_DOWN
