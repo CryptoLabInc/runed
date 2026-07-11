@@ -53,6 +53,7 @@ import (
 	"github.com/CryptoLabInc/runed/internal/backend"
 	"github.com/CryptoLabInc/runed/internal/bootstrap"
 	"github.com/CryptoLabInc/runed/internal/ipc"
+	"github.com/CryptoLabInc/runed/internal/route"
 	"github.com/CryptoLabInc/runed/internal/server"
 	"google.golang.org/grpc"
 )
@@ -126,6 +127,17 @@ func run() error {
 	// the multi-minute install window. SetBackend below flips Health
 	// to STATUS_OK once llama-server is up.
 	srv := server.New(daemonVersion)
+	srv.SetCentroidCacheDir(paths.Cache)
+	// Restore the IVF centroid set from the disk cache so a restarted daemon
+	// serves with_route immediately; a missing/corrupt cache just means
+	// routing waits for the next SetCentroids push from rune-mcp.
+	if cs, err := route.Load(paths.Cache); err == nil {
+		if err := srv.LoadCentroids(cs); err != nil {
+			logger.Warn("centroid cache rejected", "err", err)
+		} else {
+			logger.Info("centroid cache restored", "version", cs.Version, "nlist", len(cs.Vectors))
+		}
+	}
 	lis, err := ipc.Listen(sockPath)
 	if err != nil {
 		return fmt.Errorf("ipc listen: %w", err)
