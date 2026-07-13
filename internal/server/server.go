@@ -15,10 +15,37 @@ import (
 	runedv1 "github.com/CryptoLabInc/runed/gen/runed/v1"
 	"github.com/CryptoLabInc/runed/internal/backend"
 	"github.com/CryptoLabInc/runed/internal/route"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// Machine-readable reasons attached (as an ErrorInfo detail, same pattern as
+// runespace's grpcerr) to the two FAILED_PRECONDITION conditions Embed can
+// return. The status code stays FAILED_PRECONDITION for both — deliberately
+// not retryable at the transport layer (see TestServer_EmbedFailsBeforeBackendSet)
+// — but the reasons need opposite application-level handling, so clients
+// (rune-mcp) branch on the reason instead of parsing the human message:
+//
+//	ReasonBootstrapping — model still loading; wait and retry the same call.
+//	ReasonNoCentroidSet — push a set via SetCentroids, then retry (§9.2 C4).
+const (
+	errDomain           = "runed.v1"
+	ReasonBootstrapping = "BOOTSTRAPPING"
+	ReasonNoCentroidSet = "NO_CENTROID_SET"
+)
+
+// preconditionErr builds a FAILED_PRECONDITION status tagged with reason.
+// Detail attachment is best-effort: on failure the bare status still carries
+// the right code and message.
+func preconditionErr(reason, msg string) error {
+	st := status.New(codes.FailedPrecondition, msg)
+	if d, err := st.WithDetails(&errdetails.ErrorInfo{Reason: reason, Domain: errDomain}); err == nil {
+		return d.Err()
+	}
+	return st.Err()
+}
 
 // Plan A constants for the Info RPC. Qwen3-Embedding-0.6B fixes these at
 // model-load time; future revisions will source them from config or the
@@ -196,13 +223,13 @@ const embedMaxAttempts = 2
 func (s *Server) Embed(ctx context.Context, req *runedv1.EmbedRequest) (*runedv1.EmbedResponse, error) {
 	b := s.backend.Load()
 	if b == nil {
-		return nil, status.Error(codes.FailedPrecondition, "daemon is bootstrapping; embed not yet available")
+		return nil, preconditionErr(ReasonBootstrapping, "daemon is bootstrapping; embed not yet available")
 	}
 	// Fail before the forward pass: routing without a centroid set can never
 	// succeed, and the caller (rune-mcp) reacts by pushing SetCentroids first.
 	cs := s.centroids.Load()
 	if req.WithRoute && cs == nil {
-		return nil, status.Error(codes.FailedPrecondition, "no centroid set loaded; push one via SetCentroids before requesting with_route")
+		return nil, preconditionErr(ReasonNoCentroidSet, "no centroid set loaded; push one via SetCentroids before requesting with_route")
 	}
 	s.requests.Add(1)
 	for attempt := 0; attempt < embedMaxAttempts; attempt++ {
@@ -230,11 +257,11 @@ func (s *Server) Embed(ctx context.Context, req *runedv1.EmbedRequest) (*runedv1
 func (s *Server) EmbedBatch(ctx context.Context, req *runedv1.EmbedBatchRequest) (*runedv1.EmbedBatchResponse, error) {
 	b := s.backend.Load()
 	if b == nil {
-		return nil, status.Error(codes.FailedPrecondition, "daemon is bootstrapping; embed not yet available")
+		return nil, preconditionErr(ReasonBootstrapping, "daemon is bootstrapping; embed not yet available")
 	}
 	cs := s.centroids.Load()
 	if req.WithRoute && cs == nil {
-		return nil, status.Error(codes.FailedPrecondition, "no centroid set loaded; push one via SetCentroids before requesting with_route")
+		return nil, preconditionErr(ReasonNoCentroidSet, "no centroid set loaded; push one via SetCentroids before requesting with_route")
 	}
 	s.requests.Add(1)
 	for attempt := 0; attempt < embedMaxAttempts; attempt++ {
