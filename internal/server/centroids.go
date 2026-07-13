@@ -51,6 +51,7 @@ func (s *Server) SetCentroids(stream runedv1.RunedService_SetCentroidsServer) er
 			cs = &route.CentroidSet{
 				Version: p.Header.GetVersion(),
 				Dim:     int(p.Header.GetDim()),
+				Preset:  p.Header.GetPreset(),
 			}
 			if n := p.Header.GetNlist(); n > 0 {
 				cs.Vectors = make([][]float32, 0, n)
@@ -68,6 +69,13 @@ func (s *Server) SetCentroids(stream runedv1.RunedService_SetCentroidsServer) er
 		return status.Error(codes.InvalidArgument, "empty stream: header frame required")
 	}
 	if err := cs.Validate(int(vectorDim)); err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	// §9.2 C2: the version tag is a content hash — recompute it over the
+	// received vectors and reject a push whose content does not match its
+	// claim (relay assembly corruption). Skipped when the sender carried no
+	// preset (legacy chain), since the hash cannot be recreated without it.
+	if err := cs.VerifyVersion(); err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
 

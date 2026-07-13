@@ -162,6 +162,11 @@ message CentroidSetHeader {
   string version = 1; // content hash (sha256); must be non-empty
   uint32 dim = 2;     // must equal InfoResponse.vector_dim
   uint32 nlist = 3;   // total centroid count that will follow
+  // evi preset the set was trained for (e.g. "IP1") — a version-hash
+  // ingredient. When present, runed recomputes the content hash over the
+  // received vectors and rejects the push on mismatch; empty (legacy
+  // senders) skips that verification.
+  string preset = 4;
 }
 
 // CentroidBatch carries centroids in id order (append order == cluster id).
