@@ -793,10 +793,15 @@ func (*SetCentroidsRequest_Batch) isSetCentroidsRequest_Payload() {}
 
 // CentroidSetHeader opens the stream: identity and shape of the set.
 type CentroidSetHeader struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Version       string                 `protobuf:"bytes,1,opt,name=version,proto3" json:"version,omitempty"` // content hash (sha256); must be non-empty
-	Dim           uint32                 `protobuf:"varint,2,opt,name=dim,proto3" json:"dim,omitempty"`        // must equal InfoResponse.vector_dim
-	Nlist         uint32                 `protobuf:"varint,3,opt,name=nlist,proto3" json:"nlist,omitempty"`    // total centroid count that will follow
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Version string                 `protobuf:"bytes,1,opt,name=version,proto3" json:"version,omitempty"` // content hash (sha256); must be non-empty
+	Dim     uint32                 `protobuf:"varint,2,opt,name=dim,proto3" json:"dim,omitempty"`        // must equal InfoResponse.vector_dim
+	Nlist   uint32                 `protobuf:"varint,3,opt,name=nlist,proto3" json:"nlist,omitempty"`    // total centroid count that will follow
+	// evi preset the set was trained for (e.g. "IP1") — a version-hash
+	// ingredient. When present, runed recomputes the content hash over the
+	// received vectors and rejects the push on mismatch; empty (legacy
+	// senders) skips that verification.
+	Preset        string `protobuf:"bytes,4,opt,name=preset,proto3" json:"preset,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -850,6 +855,13 @@ func (x *CentroidSetHeader) GetNlist() uint32 {
 		return x.Nlist
 	}
 	return 0
+}
+
+func (x *CentroidSetHeader) GetPreset() string {
+	if x != nil {
+		return x.Preset
+	}
+	return ""
 }
 
 // CentroidBatch carries centroids in id order (append order == cluster id).
@@ -1062,11 +1074,12 @@ const file_runed_v1_runed_proto_rawDesc = "" +
 	"\x13SetCentroidsRequest\x125\n" +
 	"\x06header\x18\x01 \x01(\v2\x1b.runed.v1.CentroidSetHeaderH\x00R\x06header\x12/\n" +
 	"\x05batch\x18\x02 \x01(\v2\x17.runed.v1.CentroidBatchH\x00R\x05batchB\t\n" +
-	"\apayload\"U\n" +
+	"\apayload\"m\n" +
 	"\x11CentroidSetHeader\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\tR\aversion\x12\x10\n" +
 	"\x03dim\x18\x02 \x01(\rR\x03dim\x12\x14\n" +
-	"\x05nlist\x18\x03 \x01(\rR\x05nlist\"A\n" +
+	"\x05nlist\x18\x03 \x01(\rR\x05nlist\x12\x16\n" +
+	"\x06preset\x18\x04 \x01(\tR\x06preset\"A\n" +
 	"\rCentroidBatch\x120\n" +
 	"\tcentroids\x18\x01 \x03(\v2\x12.runed.v1.CentroidR\tcentroids\"0\n" +
 	"\bCentroid\x12\x0e\n" +
