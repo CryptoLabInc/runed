@@ -169,6 +169,23 @@ func (b *LlamaBackend) startLocked(ctx context.Context) error {
 		"--embeddings",
 		"--pooling", "last",
 		"--ctx-size", strconv.Itoa(b.cfg.CtxSize),
+		// Embedding-only workload: every prompt is unique, so the prompt cache
+		// (default cap 8 GiB) grows ~14 MiB per request at a ~0% hit rate —
+		// disable it. Likewise skip REPACK's private anonymous copy of the
+		// weights so they stay on the shared, reclaimable mmap (-640 MiB
+		// resident, ~+20% embed latency on CPU). One slot instead of auto(4):
+		// embeds are short one-shot requests, and 4 slots quadruple the KV
+		// cache (~940 MiB at ctx 2048) for concurrency this workload lacks.
+		"--cache-ram", "0",
+		"--no-repack",
+		"--parallel", "1",
+		// Smaller physical batch + quantized KV: compute scratch scales with
+		// ubatch and the KV with ctx×precision; neither changes results or the
+		// max input length, only peak memory (and adds modest latency).
+		"--batch-size", "256",
+		"--ubatch-size", "256",
+		"--cache-type-k", "q8_0",
+		"--cache-type-v", "q8_0",
 		"--host", b.cfg.Host,
 		"--port", "0", // OS-assigned
 	}
