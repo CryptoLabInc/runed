@@ -93,6 +93,11 @@ type Server struct {
 	// is persisted (empty = no persistence, used by tests).
 	centroids        atomic.Pointer[route.CentroidSet]
 	centroidCacheDir string
+	// installMu makes a SetCentroids install atomic across the in-memory
+	// store and the disk persist, so two concurrent pushes can't leave memory
+	// holding one set while the cache on disk holds another (which a restart
+	// would then silently serve). It guards only the tail, not the Recv loop.
+	installMu sync.Mutex
 
 	// Embed + EmbedBatch counter. Surfaced via HealthResponse.total_requests.
 	requests atomic.Int64
