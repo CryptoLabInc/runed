@@ -53,6 +53,12 @@ func (s *Server) SetCentroids(stream runedv1.RunedService_SetCentroidsServer) er
 				Dim:     int(p.Header.GetDim()),
 				Preset:  p.Header.GetPreset(),
 			}
+			// Header nlist is only a capacity hint for the preallocation; the
+			// authoritative count is len(cs.Vectors), built from the batches
+			// that actually arrive and reported back in the response. We don't
+			// enforce header nlist == received count — the content hash
+			// (VerifyVersion) already pins the exact vectors, so a mismatched
+			// header can't slip a wrong set through.
 			if n := p.Header.GetNlist(); n > 0 {
 				cs.Vectors = make([][]float32, 0, n)
 			}
@@ -79,6 +85,9 @@ func (s *Server) SetCentroids(stream runedv1.RunedService_SetCentroidsServer) er
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
 
+	// Install memory + disk under installMu so a concurrent push commits both
+	// as one unit; without it the two stores can interleave and diverge.
+	s.installMu.Lock()
 	s.centroids.Store(cs)
 	if s.centroidCacheDir != "" {
 		if err := cs.Persist(s.centroidCacheDir); err != nil {
@@ -87,6 +96,7 @@ func (s *Server) SetCentroids(stream runedv1.RunedService_SetCentroidsServer) er
 			slog.Warn("centroids: persist failed (set is live in memory)", "err", err, "dir", s.centroidCacheDir)
 		}
 	}
+	s.installMu.Unlock()
 	slog.Info("centroids: set installed", "version", cs.Version, "nlist", len(cs.Vectors), "dim", cs.Dim)
 
 	return stream.SendAndClose(&runedv1.SetCentroidsResponse{
