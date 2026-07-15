@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	runedv1 "github.com/CryptoLabInc/runed/gen/runed/v1"
+	"github.com/CryptoLabInc/runed/internal/backend"
 	"github.com/CryptoLabInc/runed/internal/route"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -38,6 +39,14 @@ func header(version string, dim, nlist uint32) *runedv1.SetCentroidsRequest {
 	}}
 }
 
+// headerPreset is header with a non-empty Preset, so the receiver recomputes
+// and enforces the content hash instead of skipping it as a legacy push.
+func headerPreset(version, preset string, dim, nlist uint32) *runedv1.SetCentroidsRequest {
+	return &runedv1.SetCentroidsRequest{Payload: &runedv1.SetCentroidsRequest_Header{
+		Header: &runedv1.CentroidSetHeader{Version: version, Preset: preset, Dim: dim, Nlist: nlist},
+	}}
+}
+
 func batch(vecs ...[]float32) *runedv1.SetCentroidsRequest {
 	cs := make([]*runedv1.Centroid, len(vecs))
 	for i, v := range vecs {
@@ -55,6 +64,9 @@ func dimVec(hot int) []float32 {
 	return v
 }
 
+// TestSetCentroidsInstallsAndPersists drives a well-formed header+batch stream
+// and asserts the set is installed in memory (centroids.Load), the close
+// response echoes version and nlist, and a reloadable copy lands in the cache.
 func TestSetCentroidsInstallsAndPersists(t *testing.T) {
 	s := New("test")
 	s.SetCentroidCacheDir(t.TempDir())
@@ -83,6 +95,12 @@ func TestSetCentroidsInstallsAndPersists(t *testing.T) {
 	}
 }
 
+// TestSetCentroidsRejectsBadStreams asserts each malformed stream is rejected
+// with InvalidArgument and installs no set. Cases: empty stream, batch before
+// header, duplicate header, dim mismatch against the served dimension, empty
+// version, and a content-hash mismatch (Preset present so the hash is enforced,
+// version tag deliberately wrong) — the last exercises the SetCentroids
+// VerifyVersion gate that the no-preset cases skip.
 func TestSetCentroidsRejectsBadStreams(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -99,6 +117,9 @@ func TestSetCentroidsRejectsBadStreams(t *testing.T) {
 		{"empty version", []*runedv1.SetCentroidsRequest{
 			header("", uint32(vectorDim), 1), batch(dimVec(0)),
 		}},
+		{"content hash mismatch", []*runedv1.SetCentroidsRequest{
+			headerPreset("sha256:deadbeef", "IP1", uint32(vectorDim), 1), batch(dimVec(0)),
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -114,15 +135,28 @@ func TestSetCentroidsRejectsBadStreams(t *testing.T) {
 	}
 }
 
+// TestEmbedWithRouteRequiresCentroids checks the routing precondition in
+// isolation: with a backend wired (so the bootstrap gate passes) but no
+// centroid set, an Embed with_route fails FAILED_PRECONDITION carrying the
+// NO_CENTROID_SET reason. The no-centroid check runs before the forward pass,
+// so the unstarted backend is never invoked. Asserting the reason (not just the
+// code) is what pins this to the routing branch rather than the bootstrap one.
 func TestEmbedWithRouteRequiresCentroids(t *testing.T) {
 	s := New("test")
-	// No backend yet: bootstrapping error wins regardless of routing.
+	s.SetBackend(backend.NewLlamaBackend(backend.Config{}), "test")
+
 	_, err := s.Embed(t.Context(), &runedv1.EmbedRequest{Text: "hi", WithRoute: true})
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("want FailedPrecondition, got %v", err)
 	}
+	if got := reasonOf(err); got != ReasonNoCentroidSet {
+		t.Fatalf("reason = %q, want %q", got, ReasonNoCentroidSet)
+	}
 }
 
+// TestLoadCentroidsValidates checks the boot-time restore path: LoadCentroids
+// rejects a set whose dim differs from the served dimension and accepts a
+// matching one, after which Info exposes the loaded centroid version.
 func TestLoadCentroidsValidates(t *testing.T) {
 	s := New("test")
 	bad := &route.CentroidSet{Version: "v", Dim: 8, Vectors: [][]float32{make([]float32, 8)}}

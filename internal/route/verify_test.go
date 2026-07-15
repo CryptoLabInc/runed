@@ -1,7 +1,9 @@
 package route
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"math"
 	"os"
 	"path/filepath"
@@ -39,7 +41,15 @@ func TestComputeVersionRecipe(t *testing.T) {
 			u32(math.Float32bits(f))
 		}
 	}
-	if got := ComputeVersion(s); !strings.HasPrefix(got, "sha256:") {
+	// 골든 비교: 손으로 조립한 재료 바이트를 직접 해싱해, 구현이 dim·nlist 순서,
+	// 엔디안, preset NUL 구분자까지 바이트 단위로 동일한 레시피를 따르는지 고정한다.
+	sum := sha256.Sum256(buf)
+	want := "sha256:" + hex.EncodeToString(sum[:])
+	got := ComputeVersion(s)
+	if got != want {
+		t.Fatalf("recipe drift: ComputeVersion=%s, hand-assembled=%s", got, want)
+	}
+	if !strings.HasPrefix(got, "sha256:") {
 		t.Fatalf("version prefix missing: %s", got)
 	}
 	// 같은 재료로 두 번 계산하면 결정적이어야 하고, 재료 하나만 바뀌어도 달라져야 한다.
@@ -53,6 +63,9 @@ func TestComputeVersionRecipe(t *testing.T) {
 	}
 }
 
+// TestVerifyVersion exercises the integrity gate: a set whose content matches
+// its tag passes, content mutated under an intact tag is rejected, and a legacy
+// set carrying no Preset skips verification (the hash can't be recomputed).
 func TestVerifyVersion(t *testing.T) {
 	s := verifiedSet()
 	if err := s.VerifyVersion(); err != nil {

@@ -12,6 +12,9 @@ func testSet() *CentroidSet {
 	}
 }
 
+// TestValidate covers Validate's rejection cases — nil receiver, empty
+// vectors, dim mismatch against the served dimension, and a ragged row whose
+// length differs from Dim — plus the happy path.
 func TestValidate(t *testing.T) {
 	if err := testSet().Validate(3); err != nil {
 		t.Fatalf("valid set rejected: %v", err)
@@ -34,6 +37,9 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+// TestAssign checks that Assign picks the centroid with the highest inner
+// product against the query, and that a tie resolves to the lowest cluster id
+// (matching the SDK/engine metric).
 func TestAssign(t *testing.T) {
 	s := testSet()
 	cases := []struct {
@@ -53,6 +59,10 @@ func TestAssign(t *testing.T) {
 	}
 }
 
+// TestPersistLoadRoundtrip persists a set and reloads it, asserting the
+// version/dim/shape survive the gob roundtrip and that the reloaded set still
+// routes correctly. (Preset is empty here, so Load's hash verification is
+// skipped — the content-hash path is covered by verify_test.go.)
 func TestPersistLoadRoundtrip(t *testing.T) {
 	dir := t.TempDir()
 	orig := testSet()
@@ -71,6 +81,8 @@ func TestPersistLoadRoundtrip(t *testing.T) {
 	}
 }
 
+// TestLoadMissing asserts Load errors (rather than returning an empty set)
+// when no cache file exists in the directory.
 func TestLoadMissing(t *testing.T) {
 	if _, err := Load(t.TempDir()); err == nil {
 		t.Fatal("missing cache should error")
