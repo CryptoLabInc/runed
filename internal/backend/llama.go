@@ -445,12 +445,29 @@ func (b *LlamaBackend) getCmd() *exec.Cmd {
 	return b.cmd
 }
 
+// IsHealthy probes /health and stamps proof of life on success. noteAlive is
+// here, not in probeHealthy, so restart-decision probes (EnsureStarted quick,
+// restartIfDead verdict) don't reset the liveness clock as a side effect.
+//
+// Trade-off (TestQuickProbeStampEdge): without the quick-probe stamp, a rare
+// edge (idle → slow first embed → concurrent second request with a starved
+// quick probe) makes that one request pay the verdict probe (~1.7s vs ~0.5s).
+// No false restart, no drain block, self-corrects on the next embed. If it ever
+// matters, stamp in restartIfDead's verdict probe rather than undo the split.
 func (b *LlamaBackend) IsHealthy(ctx context.Context) bool {
-	return b.probeHealthy(ctx, quickProbeTimeout)
+	ok := b.probeHealthy(ctx, quickProbeTimeout)
+	if ok {
+		b.noteAlive()
+	}
+	return ok
 }
 
-// probeHealthy GETs /health with the given budget. A success is a proof of
-// life and refreshes lastAlive.
+// probeHealthy GETs /health with the given budget and reports whether the
+// server answered 200. It does NOT record proof of life — callers that treat a
+// success as liveness (IsHealthy) stamp it themselves; the direct callers
+// (EnsureStarted's quick probe, restartIfDead's verdict probe) intentionally
+// do not, so a probe made only to decide whether to restart doesn't also reset
+// the idle/liveness clock.
 func (b *LlamaBackend) probeHealthy(ctx context.Context, timeout time.Duration) bool {
 	port := b.Port()
 	if port == 0 {
@@ -468,11 +485,7 @@ func (b *LlamaBackend) probeHealthy(ctx context.Context, timeout time.Duration) 
 		return false
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return false
-	}
-	b.noteAlive()
-	return true
+	return resp.StatusCode == 200
 }
 
 // Serving reports whether the backend can currently serve embeddings, and if
