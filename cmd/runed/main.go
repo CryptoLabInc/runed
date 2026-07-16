@@ -214,6 +214,7 @@ func run() error {
 		ModelPath:  model,
 		LogPath:    filepath.Join(paths.Logs, "llama-server.log"),
 		CtxSize:    ctxSize,
+		PidPath:    filepath.Join(paths.Home, "llama.pid"),
 	})
 	// NOTE: backend uses exec.CommandContext(ctx, ...) internally, which means
 	// the child llama-server dies when this ctx is Done. We therefore pass the

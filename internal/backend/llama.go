@@ -43,6 +43,10 @@ type Config struct {
 	LogPath    string // if non-empty, stderr → file
 	Host       string // default 127.0.0.1
 	CtxSize    int    // default 2048; --ctx-size in tokens = max input length (llama-server rejects longer input with HTTP 400)
+	// PidPath, if non-empty, records the spawned llama-server's pid+binary so
+	// the next runed can reap an orphan left by a SIGKILLed predecessor (see
+	// pidfile.go). Empty disables recording and sweeping.
+	PidPath string
 }
 
 // ServingState is the backend's current ability to serve embeddings, as
@@ -159,6 +163,10 @@ func (b *LlamaBackend) Start(ctx context.Context) error {
 	b.lifecycleMu.Lock()
 	defer b.lifecycleMu.Unlock()
 	b.daemonCtx = ctx
+	// A previous runed that died by SIGKILL/jetsam could not run its shutdown
+	// path; if its llama-server is still alive, reap it before spawning ours
+	// or the machine ends up with two ~1.7 GB inference servers.
+	sweepOrphanChild(b.cfg.PidPath, b.cfg.BinaryPath)
 	return b.startLocked(ctx)
 }
 
@@ -324,6 +332,15 @@ func (b *LlamaBackend) startLocked(ctx context.Context) error {
 	b.port = 0
 	b.cmdDone = done
 	b.state = childRunning
+	// Record the child before anything can fail below: if runed itself is
+	// SIGKILLed from here on, the next boot's sweep finds the orphan. The
+	// write happens under mu, in the same critical section that installs
+	// b.cmd, so it is totally ordered against watchChild's owner-guarded
+	// clear — otherwise a watcher reaping the PREVIOUS child could delete
+	// this record right after we write it.
+	if err := writeChildPid(b.cfg.PidPath, cmd.Process.Pid, b.cfg.BinaryPath); err != nil {
+		slog.Warn("backend: could not record llama pidfile (orphan sweep degraded)", "err", err)
+	}
 	b.mu.Unlock()
 	go b.watchChild(cmd, done)
 
@@ -426,6 +443,12 @@ func (b *LlamaBackend) watchChild(cmd *exec.Cmd, done chan struct{}) {
 		// overrides to childSuspended afterward — it waits on done, so its
 		// write lands strictly after this one.
 		b.state = childFailed
+		// The child is reaped — drop its record so the pidfile exists
+		// exactly while a child runs. Owner-guarded and under mu: only the
+		// watcher of the CURRENT child clears, and the clear is totally
+		// ordered against the next spawn's write (also under mu), so it can
+		// never delete a successor's record.
+		clearChildPid(b.cfg.PidPath)
 	}
 	b.mu.Unlock()
 	// Log before close(done) so readers of done can rely on the log
