@@ -77,6 +77,10 @@ func (b *LlamaBackend) doJSON(ctx context.Context, path string, in any, out any)
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
 		return fmt.Errorf("decode: %w", err)
 	}
+	// A completed request is the strongest proof of life there is — it keeps
+	// EnsureStarted's health verdict from mistaking a saturated child (whose
+	// /health probes starve under inference load) for a dead one.
+	b.noteAlive()
 	return nil
 }
 
