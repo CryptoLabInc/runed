@@ -57,6 +57,7 @@ func TestEnsureStartedBusyChildIsLeftAlone(t *testing.T) {
 func TestEnsureStartedDrainRecoverySkipsRestart(t *testing.T) {
 	var busy atomic.Bool
 	busy.Store(true)
+	received := make(chan struct{})
 	release := make(chan struct{})
 	b, _ := newVerdictBackend(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/health") {
@@ -68,6 +69,7 @@ func TestEnsureStartedDrainRecoverySkipsRestart(t *testing.T) {
 			return
 		}
 		// the in-flight embed: blocks until released, then "queue drained"
+		close(received)
 		<-release
 		busy.Store(false)
 		w.Header().Set("Content-Type", "application/json")
@@ -80,7 +82,13 @@ func TestEnsureStartedDrainRecoverySkipsRestart(t *testing.T) {
 		_, err := b.Embed(context.Background(), "x", true)
 		embedDone <- err
 	}()
-	time.Sleep(100 * time.Millisecond) // let the embed take its RLock
+	// Handshake, not a sleep: the drain assertion below is only meaningful
+	// once the embed actually holds its RLock inside the fake server.
+	select {
+	case <-received:
+	case <-time.After(2 * time.Second):
+		t.Fatal("embed never reached the fake llama-server")
+	}
 
 	ensureDone := make(chan error, 1)
 	go func() { ensureDone <- b.EnsureStarted() }()

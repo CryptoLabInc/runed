@@ -235,6 +235,13 @@ func (b *LlamaBackend) restartIfDead(dctx context.Context) error {
 	b.restartMu.Lock()
 	defer b.restartMu.Unlock()
 
+	// Followers queued behind a leader re-check the cheap signals first: the
+	// leader's drain let embeds complete (stamping lastAlive) and a restart's
+	// startup health poll stamps it too — without this, every queued follower
+	// would run its own drain cycle in series.
+	if b.recentlyAlive(aliveGrace) {
+		return nil
+	}
 	if b.probeHealthy(dctx, verdictProbeTimeout) {
 		return nil // recovered (or a predecessor restarted it)
 	}
