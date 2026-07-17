@@ -51,7 +51,7 @@ type RunedServiceClient interface {
 	Shutdown(ctx context.Context, in *ShutdownRequest, opts ...grpc.CallOption) (*ShutdownResponse, error)
 	// SetCentroids replaces the daemon's IVF centroid set (header frame, then
 	// id-ordered batches — the same wire shape runespace's GetCentroids
-	// streams). rune-mcp relays the set here from the Vault so Embed can route
+	// streams). rune-mcp relays the set here from the Console so Embed can route
 	// inserts (with_route) without runed ever dialing the index engine. The
 	// set is persisted to the daemon cache and survives restarts.
 	SetCentroids(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[SetCentroidsRequest, SetCentroidsResponse], error)
@@ -152,7 +152,7 @@ type RunedServiceServer interface {
 	Shutdown(context.Context, *ShutdownRequest) (*ShutdownResponse, error)
 	// SetCentroids replaces the daemon's IVF centroid set (header frame, then
 	// id-ordered batches — the same wire shape runespace's GetCentroids
-	// streams). rune-mcp relays the set here from the Vault so Embed can route
+	// streams). rune-mcp relays the set here from the Console so Embed can route
 	// inserts (with_route) without runed ever dialing the index engine. The
 	// set is persisted to the daemon cache and survives restarts.
 	SetCentroids(grpc.ClientStreamingServer[SetCentroidsRequest, SetCentroidsResponse]) error

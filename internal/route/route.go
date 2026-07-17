@@ -1,7 +1,7 @@
 // Package route holds the daemon's IVF centroid set and the plaintext
 // cluster assignment used to route inserts. runed never dials the index
 // engine: the set arrives via the SetCentroids RPC (relayed
-// runespace → vault → rune-mcp → runed) and is cached on disk so a restart
+// runespace → console → rune-mcp → runed) and is cached on disk so a restart
 // does not need a re-push. Assignment must agree byte-for-byte with the
 // engine's insert routing: max inner product over l2-normalized vectors,
 // ties to the lowest id (mirrors runespace-go-sdk clustering).
