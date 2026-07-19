@@ -28,7 +28,13 @@ import (
 // which can delete a healthy daemon's socket after $RUNED_HOME is recreated
 // out from under a running daemon. StillOwned exposes the same identity check
 // so the daemon can self-evict when its socket is taken over.
+//
+// A path at/over the sun_path limit is transparently remapped via
+// ResolveSocketPath before binding (INST-7) — binding the canonical path
+// would fail with a cryptic "bind: invalid argument". Clients resolve the
+// same canonical path before dialing, so both sides meet at the alias.
 func Listen(path string) (Listener, error) {
+	path = ResolveSocketPath(path)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir parent: %w", err)
 	}
