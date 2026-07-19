@@ -1,6 +1,6 @@
 // Package runed exposes the repository's license texts as an embedded
 // filesystem so the self-bootstrap can install them next to the third-party
-// artifacts it downloads (OPS-90). Redistribution of llama-server (MIT) and
+// artifacts it downloads. Redistribution of llama-server (MIT) and
 // the Qwen3 GGUF weights (Apache-2.0) requires shipping the license texts
 // with the copies — embedding them in the daemon binary guarantees every
 // machine that receives the artifacts also receives the licenses.

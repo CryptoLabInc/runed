@@ -1,15 +1,17 @@
 package bootstrap
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	runed "github.com/CryptoLabInc/runed"
 )
 
 // installLicenses must land every embedded license text under
-// $RUNED_HOME/licenses/, byte-identical to the embedded copy (OPS-90).
+// $RUNED_HOME/licenses/, byte-identical to the embedded copy.
 func TestInstallLicenses_WritesAllTextsVerbatim(t *testing.T) {
 	home := t.TempDir()
 	p := &Paths{Home: home}
@@ -35,6 +37,57 @@ func TestInstallLicenses_WritesAllTextsVerbatim(t *testing.T) {
 		if string(got) != string(want) {
 			t.Errorf("%s: installed copy differs from embedded text", path)
 		}
+	}
+}
+
+// Every public install entry point must stop before installing an artifact when
+// the accompanying license texts cannot be written.
+func TestEnsureEntryPointsFailWhenLicensesCannotBeInstalled(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*Paths, *Manifest) error
+	}{
+		{
+			name: "all",
+			run: func(p *Paths, m *Manifest) error {
+				_, _, _, err := EnsureAll(t.Context(), p, m, slog.Default(), nil)
+				return err
+			},
+		},
+		{
+			name: "llama server",
+			run: func(p *Paths, m *Manifest) error {
+				_, err := EnsureLlamaServer(t.Context(), p, m, slog.Default(), nil)
+				return err
+			},
+		},
+		{
+			name: "model",
+			run: func(p *Paths, m *Manifest) error {
+				_, _, err := EnsureModel(t.Context(), p, m, slog.Default(), nil)
+				return err
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv(EnvHome, home)
+			p, err := Resolve()
+			if err != nil {
+				t.Fatalf("resolve paths: %v", err)
+			}
+			// A regular file blocks creation of the required licenses directory.
+			if err := os.WriteFile(filepath.Join(home, "licenses"), []byte("blocked"), 0o600); err != nil {
+				t.Fatalf("block license directory: %v", err)
+			}
+			m := &Manifest{DefaultModel: "test-model"}
+			err = tc.run(p, m)
+			if err == nil || !strings.Contains(err.Error(), "install licenses") {
+				t.Fatalf("error = %v, want install licenses failure", err)
+			}
+		})
 	}
 }
 
