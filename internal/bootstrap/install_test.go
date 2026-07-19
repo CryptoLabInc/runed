@@ -226,6 +226,9 @@ func TestEnsureModel_NoLlamaServerEntryNeeded(t *testing.T) {
 	if gotVariant != variant {
 		t.Errorf("got variant %q, want %q", gotVariant, variant)
 	}
+	if _, err := os.Stat(filepath.Join(dir, "licenses", "THIRD_PARTY_LICENSES", "Qwen3-Embedding.Apache-2.0.LICENSE")); err != nil {
+		t.Fatalf("partial model bootstrap did not install license texts: %v", err)
+	}
 }
 
 // Stage tick fires on Ensure* entry so Health flips Phase even when

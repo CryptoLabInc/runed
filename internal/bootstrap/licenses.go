@@ -12,7 +12,7 @@ import (
 // installLicenses copies the embedded license texts (runed's own LICENSE plus
 // the third-party texts for llama-server and the Qwen3 GGUF model) into
 // $RUNED_HOME/licenses/, so the machine that just received the downloaded
-// artifacts also holds the licenses that cover them (OPS-90). Idempotent —
+// artifacts also holds the licenses that cover them. Idempotent —
 // files are rewritten in place on every bootstrap, so license updates ship
 // with daemon updates.
 func installLicenses(p *Paths) error {
