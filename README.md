@@ -162,7 +162,7 @@ Set the daemon's `RUNED_MODEL` env var to the desired GGUF path.
 
 ## License
 
-- `runed` Go code: MIT — see [`LICENSE`](LICENSE).
+- `runed` Go code: Apache-2.0 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
 - llama.cpp (`llama-server`): MIT — see
   [`THIRD_PARTY_LICENSES/llama.cpp.LICENSE`](THIRD_PARTY_LICENSES/llama.cpp.LICENSE).
 - Qwen3-Embedding-0.6B (GGUF): Apache-2.0 — see
