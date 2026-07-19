@@ -24,6 +24,7 @@ import (
 	"sync"
 
 	runedv1 "github.com/CryptoLabInc/runed/gen/runed/v1"
+	"github.com/CryptoLabInc/runed/internal/ipc"
 	"github.com/CryptoLabInc/runed/internal/spawn"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -40,10 +41,14 @@ type Client struct {
 	// happy path (non-Unavailable RPCs) is unlocked.
 	mu sync.Mutex
 
-	conn       *grpc.ClientConn
-	grpc       runedv1.RunedServiceClient
-	socketPath string // captured at Connect time for retry/respawn (T9)
-	noSpawn    bool   // captured to avoid retrying when caller opted out (T9)
+	conn *grpc.ClientConn
+	grpc runedv1.RunedServiceClient
+	// socketPath is the CANONICAL path captured at Connect time for
+	// retry/respawn (T9). Dial sites resolve it via ipc.ResolveSocketPath
+	// (INST-7); spawn.EnsureDaemon needs the canonical form because it
+	// derives the daemon's RUNED_HOME from the path's parent directory.
+	socketPath string
+	noSpawn    bool // captured to avoid retrying when caller opted out (T9)
 }
 
 // Option configures Connect behavior.
@@ -115,9 +120,14 @@ func Connect(ctx context.Context, opts ...Option) (*Client, error) {
 // dialer to receive the full "unix://..." URI as its addr, which then
 // becomes "unix:///path" after the net.Dialer prepends no scheme — the
 // socket file "unix:///path" of course does not exist.
+//
+// The canonical socketPath is resolved just-in-time for the dial (INST-7):
+// when it exceeds the sun_path limit the daemon binds a short deterministic
+// alias, and connect() on the canonical path would fail with EINVAL. The
+// Client keeps the canonical form so respawn derives the right RUNED_HOME.
 func dialAndProbe(ctx context.Context, socketPath string) (*Client, error) {
 	conn, err := grpc.NewClient(
-		"unix://"+socketPath,
+		"unix://"+ipc.ResolveSocketPath(socketPath),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {
@@ -143,7 +153,7 @@ func dialAndProbe(ctx context.Context, socketPath string) (*Client, error) {
 func (c *Client) reconnectLocked() error {
 	c.conn.Close()
 	conn, err := grpc.NewClient(
-		"unix://"+c.socketPath,
+		"unix://"+ipc.ResolveSocketPath(c.socketPath), // INST-7: dial the alias
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {

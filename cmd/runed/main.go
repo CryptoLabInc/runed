@@ -92,7 +92,12 @@ func run() error {
 	}
 	logger.Info("paths resolved", "home", paths.Home)
 
-	sockPath := filepath.Join(paths.Home, "embedding.sock")
+	// INST-7: when $RUNED_HOME is deep, the canonical path exceeds the
+	// platform's sun_path limit (104 bytes on macOS, 108 on Linux) and cannot
+	// be bound or dialed. Resolve it up front so the reachability probe, the
+	// stale-socket cleanup, the ownership watchdog, and the actual bind all
+	// operate on the same (possibly short-aliased) path the client dials.
+	sockPath := ipc.ResolveSocketPath(filepath.Join(paths.Home, "embedding.sock"))
 
 	// Early bail-out: if another daemon is already accepting connections on
 	// our socket, we'd just waste time on self-bootstrap before failing at
