@@ -92,7 +92,7 @@ func run() error {
 	}
 	logger.Info("paths resolved", "home", paths.Home)
 
-	// INST-7: when $RUNED_HOME is deep, the canonical path exceeds the
+	// When $RUNED_HOME is deep, the canonical path can exceed the
 	// platform's sun_path limit (104 bytes on macOS, 108 on Linux) and cannot
 	// be bound or dialed. Resolve it up front so the reachability probe, the
 	// stale-socket cleanup, the ownership watchdog, and the actual bind all

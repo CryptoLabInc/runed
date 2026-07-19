@@ -72,10 +72,9 @@ func TestResolveSocketPath_UncleanedSpellingsConverge(t *testing.T) {
 	}
 }
 
-// TestListen_LongPathBindsAndDials is the INST-7 end-to-end regression: a
-// canonical socket path over the sun_path limit (deep $RUNED_HOME) must still
-// yield a listener the client can reach, via the deterministic short alias
-// both sides resolve independently.
+// TestListen_LongPathBindsAndDials verifies that a canonical socket path over
+// the sun_path limit yields a listener reachable through the deterministic
+// short alias.
 func TestListen_LongPathBindsAndDials(t *testing.T) {
 	base := shortTempDir(t)
 	deep := filepath.Join(base, strings.Repeat("d", 60), strings.Repeat("e", 60))

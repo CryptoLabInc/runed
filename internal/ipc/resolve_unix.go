@@ -25,7 +25,7 @@ func socketAliasDir() string {
 }
 
 // ResolveSocketPath returns a bindable/dialable path for the canonical socket
-// path (INST-7). Short absolute paths are returned unchanged; a path at/over the
+// path. Short absolute paths are returned unchanged; a path at/over the
 // sun_path limit is mapped to a deterministic alias under a short, per-user
 // runtime directory so daemon and client converge without a handshake.
 //

@@ -29,7 +29,7 @@ import (
 // so the daemon can self-evict when its socket is taken over.
 //
 // A path at/over the sun_path limit is transparently remapped via
-// ResolveSocketPath before binding (INST-7) — binding the canonical path
+// ResolveSocketPath before binding; binding the canonical path
 // would fail with a cryptic "bind: invalid argument". Clients resolve the
 // same canonical path before dialing, so both sides meet at the alias.
 func Listen(path string) (Listener, error) {
