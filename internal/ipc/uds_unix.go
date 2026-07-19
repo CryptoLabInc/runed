@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
 	"sync"
 	"syscall"
 )
@@ -35,7 +34,7 @@ import (
 // same canonical path before dialing, so both sides meet at the alias.
 func Listen(path string) (Listener, error) {
 	path = ResolveSocketPath(path)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := ensureSocketParent(path); err != nil {
 		return nil, fmt.Errorf("mkdir parent: %w", err)
 	}
 
