@@ -22,6 +22,7 @@ func TestInstallLicenses_WritesAllTextsVerbatim(t *testing.T) {
 
 	for _, path := range []string{
 		"LICENSE",
+		"NOTICE",
 		"THIRD_PARTY_LICENSES/README.md",
 		"THIRD_PARTY_LICENSES/llama.cpp.LICENSE",
 		"THIRD_PARTY_LICENSES/Qwen3-Embedding.Apache-2.0.LICENSE",

@@ -91,7 +91,7 @@ release-tarball:
 	TARNAME=runed-$(VERSION)-$(OS_LABEL)-$(GOARCH).tar.gz; \
 	tar -czf dist/$$TARNAME \
 		-C bin runed rundemo llama-server \
-		-C $(CURDIR) LICENSE THIRD_PARTY_LICENSES; \
+		-C $(CURDIR) LICENSE NOTICE THIRD_PARTY_LICENSES; \
 	cd dist && ( \
 		(command -v shasum >/dev/null 2>&1 && shasum -a 256 $$TARNAME > $$TARNAME.sha256) \
 		|| (command -v sha256sum >/dev/null 2>&1 && sha256sum $$TARNAME > $$TARNAME.sha256) \

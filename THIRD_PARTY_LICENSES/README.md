@@ -20,5 +20,6 @@ Notes:
   the canonical Apache License 2.0 text is reproduced here unmodified. No
   NOTICE contents exist upstream to reproduce (Apache-2.0 §4(d) applies only
   when the work includes a NOTICE file).
-- `runed` itself is licensed under the MIT License — see the top-level
-  [`LICENSE`](../LICENSE).
+- `runed` itself is licensed under the Apache License 2.0 — see the top-level
+  [`LICENSE`](../LICENSE) and [`NOTICE`](../NOTICE) (Apache-2.0 §4(d):
+  redistributions must include the NOTICE file).
