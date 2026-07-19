@@ -85,7 +85,7 @@ func EnsureDaemon(ctx context.Context, socketPath string) error {
 // happens later when the caller's Connect runs.
 //
 // The canonical path is resolved via ipc.ResolveSocketPath before any
-// stat/dial (INST-7): when $RUNED_HOME is deep, the daemon binds a short
+// stat/dial: when $RUNED_HOME is deep, the daemon binds a short
 // deterministic alias, and probing the canonical path would always report
 // the daemon absent. EnsureDaemon deliberately keeps the CANONICAL path for
 // everything else — the spawn.lock location, and the RUNED_HOME the daemon

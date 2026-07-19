@@ -43,12 +43,12 @@ type Client struct {
 
 	conn *grpc.ClientConn
 	grpc runedv1.RunedServiceClient
-	// socketPath is the CANONICAL path captured at Connect time for
-	// retry/respawn (T9). Dial sites resolve it via ipc.ResolveSocketPath
-	// (INST-7); spawn.EnsureDaemon needs the canonical form because it
+	// socketPath is the canonical path captured at Connect time for
+	// retry and respawn. Dial sites resolve it via ipc.ResolveSocketPath;
+	// spawn.EnsureDaemon needs the canonical form because it
 	// derives the daemon's RUNED_HOME from the path's parent directory.
 	socketPath string
-	noSpawn    bool // captured to avoid retrying when caller opted out (T9)
+	noSpawn    bool // captured to avoid retrying when the caller opted out
 }
 
 // Option configures Connect behavior.
@@ -121,7 +121,7 @@ func Connect(ctx context.Context, opts ...Option) (*Client, error) {
 // becomes "unix:///path" after the net.Dialer prepends no scheme — the
 // socket file "unix:///path" of course does not exist.
 //
-// The canonical socketPath is resolved just-in-time for the dial (INST-7):
+// The canonical socketPath is resolved just-in-time for the dial:
 // when it exceeds the sun_path limit the daemon binds a short deterministic
 // alias, and connect() on the canonical path would fail with EINVAL. The
 // Client keeps the canonical form so respawn derives the right RUNED_HOME.
@@ -153,7 +153,7 @@ func dialAndProbe(ctx context.Context, socketPath string) (*Client, error) {
 func (c *Client) reconnectLocked() error {
 	c.conn.Close()
 	conn, err := grpc.NewClient(
-		"unix://"+ipc.ResolveSocketPath(c.socketPath), // INST-7: dial the alias
+		"unix://"+ipc.ResolveSocketPath(c.socketPath),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
 	if err != nil {

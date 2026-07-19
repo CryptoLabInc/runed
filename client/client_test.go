@@ -94,9 +94,8 @@ func TestConnect_WithNoSpawn_FailsFastWhenNoDaemon(t *testing.T) {
 	}
 }
 
-// TestConnect_LongSocketPath is the client-side half of INST-7. Listen and
-// Connect independently resolve the same over-limit canonical path, and the
-// real gRPC Health probe must cross that aliased socket successfully.
+// TestConnect_LongSocketPath verifies that Listen and Connect independently
+// resolve the same over-limit canonical path and exchange a real Health RPC.
 func TestConnect_LongSocketPath(t *testing.T) {
 	home := filepath.Join(shortTempDir(t), strings.Repeat("d", 60), strings.Repeat("e", 60))
 	canonical := filepath.Join(home, "embedding.sock")
