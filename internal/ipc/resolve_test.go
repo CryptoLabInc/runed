@@ -3,6 +3,7 @@
 package ipc
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -23,7 +24,8 @@ func TestResolveSocketPath_LongPathAliased(t *testing.T) {
 		t.Fatalf("test setup: path not long enough (%d bytes)", len(long))
 	}
 	got := ResolveSocketPath(long)
-	if !strings.HasPrefix(got, "/tmp/runed-") || !strings.HasSuffix(got, ".sock") {
+	wantDir := filepath.Join("/tmp", fmt.Sprintf("runed-%d", os.Getuid()))
+	if filepath.Dir(got) != wantDir || !strings.HasPrefix(filepath.Base(got), "runed-") || !strings.HasSuffix(got, ".sock") {
 		t.Fatalf("alias has wrong shape: %q", got)
 	}
 	if len(got) >= sunPathLimit {
@@ -43,6 +45,18 @@ func TestResolveSocketPath_LongPathAliased(t *testing.T) {
 	// defensive double-resolution at bind/dial sites is harmless.
 	if re := ResolveSocketPath(got); re != got {
 		t.Fatalf("alias not idempotent: %q -> %q", got, re)
+	}
+}
+
+func TestResolveSocketPath_RelativeAndAbsoluteSpellingsConverge(t *testing.T) {
+	relative := filepath.Join(strings.Repeat("d", 60), strings.Repeat("e", 60), "embedding.sock")
+	absolute, err := filepath.Abs(relative)
+	if err != nil {
+		t.Fatalf("abs: %v", err)
+	}
+	if ResolveSocketPath(relative) != ResolveSocketPath(absolute) {
+		t.Fatalf("relative and absolute spellings diverged: %q vs %q",
+			ResolveSocketPath(relative), ResolveSocketPath(absolute))
 	}
 }
 
@@ -100,5 +114,12 @@ func TestListen_LongPathBindsAndDials(t *testing.T) {
 	}
 	if info.Mode()&0o777 != 0o700 {
 		t.Fatalf("want mode 0700 on alias, got %o", info.Mode()&0o777)
+	}
+	parent, err := os.Stat(filepath.Dir(resolved))
+	if err != nil {
+		t.Fatalf("stat alias parent: %v", err)
+	}
+	if parent.Mode().Perm() != 0o700 {
+		t.Fatalf("want alias parent mode 0700, got %o", parent.Mode().Perm())
 	}
 }
