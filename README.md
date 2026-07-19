@@ -162,10 +162,14 @@ Set the daemon's `RUNED_MODEL` env var to the desired GGUF path.
 
 ## License
 
-- `runed` Go code: MIT (LICENSE file forthcoming).
-- Qwen3-Embedding-0.6B: Apache 2.0.
-- llama.cpp: MIT.
+- `runed` Go code: MIT — see [`LICENSE`](LICENSE).
+- llama.cpp (`llama-server`): MIT — see
+  [`THIRD_PARTY_LICENSES/llama.cpp.LICENSE`](THIRD_PARTY_LICENSES/llama.cpp.LICENSE).
+- Qwen3-Embedding-0.6B (GGUF): Apache-2.0 — see
+  [`THIRD_PARTY_LICENSES/Qwen3-Embedding.Apache-2.0.LICENSE`](THIRD_PARTY_LICENSES/Qwen3-Embedding.Apache-2.0.LICENSE).
 
-Redistribution of the bundled `llama-server` binary and GGUF model files is
-permitted under the respective upstream licenses; CryptoLab makes no
-independent claims on those artifacts.
+The attribution index lives in
+[`THIRD_PARTY_LICENSES/README.md`](THIRD_PARTY_LICENSES/README.md). The
+self-bootstrap installs these texts to `$RUNED_HOME/licenses/` alongside the
+downloaded `llama-server` binary and GGUF weights, so every machine that
+receives the artifacts also receives the licenses that cover them.

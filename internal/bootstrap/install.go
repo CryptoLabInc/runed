@@ -103,6 +103,13 @@ func EnsureAll(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger, 
 		logger.Warn("audit: installed.json write failed", "err", auditErr)
 	}
 
+	// Ship the license texts with the artifacts they cover (OPS-90). A write
+	// failure is surfaced but does not brick the daemon — the artifacts above
+	// are already installed and the next bootstrap retries the copy.
+	if licErr := installLicenses(p); licErr != nil {
+		logger.Warn("licenses: install failed", "err", licErr)
+	}
+
 	return llamaBinPath, modelPath, variant, nil
 }
 
