@@ -84,12 +84,14 @@ test:
 clean:
 	rm -rf bin/ gen/ dist/
 
-# Packages the Go binaries plus llama-server into a single tarball.
+# Packages the Go binaries, llama-server, and their license texts into a single tarball.
 # Assumes `make build` and `make llama-server` have already populated bin/.
 release-tarball:
 	mkdir -p dist
 	TARNAME=runed-$(VERSION)-$(OS_LABEL)-$(GOARCH).tar.gz; \
-	tar -czf dist/$$TARNAME -C bin runed rundemo llama-server; \
+	tar -czf dist/$$TARNAME \
+		-C bin runed rundemo llama-server \
+		-C $(CURDIR) LICENSE NOTICE THIRD_PARTY_LICENSES; \
 	cd dist && ( \
 		(command -v shasum >/dev/null 2>&1 && shasum -a 256 $$TARNAME > $$TARNAME.sha256) \
 		|| (command -v sha256sum >/dev/null 2>&1 && sha256sum $$TARNAME > $$TARNAME.sha256) \

@@ -1,171 +1,168 @@
-# runed — Shared embedding daemon
+<p align="center">
+  <a href="https://rune.team" aria-label="RUNE website">
+    <img src=".github/assets/repo-hero.svg" alt="runed — shared local embedding runtime" width="100%">
+  </a>
+</p>
 
-`runed` is a Go daemon that wraps [llama.cpp](https://github.com/ggml-org/llama.cpp)
-`llama-server` to serve Qwen3-Embedding-0.6B embeddings via gRPC over a UNIX
-domain socket. It is designed as a **shared singleton process per machine** so
-that multiple client sessions do not each load their own ~400 MB embedding
-model.
+<p align="center">
+  <img src=".github/assets/repo-badges.svg" alt="Embedding daemon · Qwen3 0.6B · Apache 2.0 · Release v1.0.0-alpha" width="790">
+</p>
+
+<p align="center">
+  <a href="https://rune.team">rune.team</a> ·
+  <a href="https://rune.team/docs">Documentation</a> ·
+  <a href="https://github.com/CryptoLabInc/runed/releases">Releases</a>
+</p>
+
+`runed` is RUNE's shared local embedding daemon. It keeps one Qwen3 embedding model per machine and serves every agent session over a Unix domain socket, avoiding a separate model copy for every `rune-mcp` process.
+
+The daemon starts on demand, verifies every downloaded artifact by SHA-256, suspends the heavyweight `llama-server` child when idle, and brings it back transparently on the next embedding request.
+
+## Why a shared daemon
+
+```text
+agent session A ── rune-mcp A ─┐
+agent session B ── rune-mcp B ─┼── Unix socket ── runed ── llama-server
+agent session C ── rune-mcp C ─┘                    └─ one Qwen3 model
+```
+
+- **One model per machine** instead of one model per agent session.
+- **Local text processing** so passages do not need to leave the user's device for embedding.
+- **Automatic startup** serialized across concurrent clients.
+- **Idle suspension** that releases model memory without removing the daemon socket.
+- **Verified bootstrap** for the `llama-server` archive and GGUF model.
+- **Single and batch RPCs** with L2-normalized vectors.
 
 ## Installation
 
-`runed` is normally installed via the [`rune` CLI](https://github.com/CryptoLabInc/rune):
+End users normally receive `runed` through the [RUNE](https://github.com/CryptoLabInc/rune) installer. The bootstrap layer places the binary under `~/.runed/bin/`, then `rune-mcp` starts it automatically when an embedding is first needed.
 
-```
-rune install
-```
+For standalone development:
 
-This places the binary at `~/.runed/bin/runed` with a manifest URL baked
-in at build time (via `-ldflags`). End users don't need to set any
-environment variable — the first launch downloads the `llama-server`
-release tarball and the embedding GGUF described by the manifest into
-`~/.runed/{bin/llama-cpp,models}/`. Subsequent launches reuse the
-installed artifacts as long as the manifest SHA-256s still match.
-
-For standalone testing of the daemon without `rune`, see
-[`scripts/dev_standalone.sh`](scripts/dev_standalone.sh).
-
-## Usage
-
-`runed` is a passive gRPC daemon. It is normally spawned on demand by a
-client (e.g. `rune-mcp`, `rundemo`, or any program that imports the
-`client/` package) the first time an embedding request arrives:
-
-```
-client.Connect()
-    socket dial fails
-    → spawn.EnsureDaemon execs ~/.runed/bin/runed (detached)
-       → paths.Resolve / EnsureDirs
-       → socket probe (exit 0 if another daemon already listening)
-       → self-bootstrap (manifest fetch → llama-server tarball + GGUF
-         download on first boot, SHA cache check on subsequent boots)
-       → backend.Start (llama-server child, port 0)
-       → listen on ~/.runed/embedding.sock
-    client reconnects → embed RPC → result
+```bash
+git clone https://github.com/CryptoLabInc/runed.git
+cd runed
+make build
+./scripts/dev_standalone.sh
 ```
 
-Direct foreground launch is supported for development and debugging:
+Linux and macOS are supported. The current client deliberately rejects Windows because the Plan A transport uses a Unix domain socket.
 
-```
-./bin/runed
+## Go client
+
+Programs can use the public [`client`](client/) package directly:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	"github.com/CryptoLabInc/runed/client"
+)
+
+func main() {
+	ctx := context.Background()
+
+	c, err := client.Connect(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer c.Close()
+
+	vector, err := c.Embed(ctx, "Why did we cap retry backoff at five minutes?")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(len(vector))
+}
 ```
 
-After `RUNED_IDLE_TIMEOUT` (default 10m) of no RPC activity, the daemon
-stops its `llama-server` child to release the ~470MB+ of model weights
-from memory — but `runed` itself stays up with the gRPC socket still
-listening. The next `Embed`/`EmbedBatch` RPC transparently restarts the
-backend (cold-start latency paid only on that single request). The
-daemon process exits only on SIGINT/SIGTERM/SIGHUP or a Shutdown RPC.
+`client.Connect` first probes the default socket. If no healthy daemon is present, it serializes startup, launches `runed`, waits for health, and reconnects. `client.WithNoSpawn()` is available for tests and explicitly managed deployments.
+
+## Runtime lifecycle
+
+On first boot, `runed` performs the following sequence:
+
+1. Resolve `RUNED_HOME` and the daemon socket.
+2. Fetch the release manifest over HTTPS.
+3. Download and verify the platform-specific `llama-server` archive.
+4. Download and verify the selected Qwen3 GGUF model.
+5. Launch `llama-server` on an ephemeral loopback port.
+6. Serve gRPC over `~/.runed/embedding.sock`.
+
+Subsequent boots reuse artifacts whose SHA-256 hashes still match the manifest.
+
+After `RUNED_IDLE_TIMEOUT` without an embedding RPC, only the `llama-server` child stops. `runed` stays reachable and restarts the backend for the next `Embed` or `EmbedBatch` call. Set the timeout to `0` to disable idle suspension.
 
 ## Configuration
 
-### Environment
-
 | Variable | Purpose | Default |
-|---|---|---|
-| `RUNED_HOME`          | Data directory                                              | `~/.runed` |
-| `RUNED_MANIFEST`      | Manifest URL for self-bootstrap                             | `DefaultManifestURL` (build-time ldflags) |
-| `RUNED_LLAMA_SERVER`  | Skip self-bootstrap; use this binary                        | (unset) |
-| `RUNED_MODEL`         | Skip self-bootstrap; use this GGUF                          | (unset) |
-| `RUNED_MODEL_VARIANT` | Pick a non-default model from `manifest.models`             | `manifest.default_model` |
-| `RUNED_CTX_SIZE`      | `llama-server --ctx-size` (max input length in tokens)      | 2048 |
-| `RUNED_IDLE_TIMEOUT`  | After this much idle, stop the llama-server child to free model memory. `runed` itself stays up; the next Embed RPC resurrects the backend. `"0"` disables suspend | 10m |
+| --- | --- | --- |
+| `RUNED_HOME` | Runtime, model, log, and socket directory. | `~/.runed` |
+| `RUNED_MANIFEST` | Self-bootstrap manifest URL. | Build-time release URL |
+| `RUNED_LLAMA_SERVER` | Use an explicit `llama-server` binary and skip that download. | Unset |
+| `RUNED_MODEL` | Use an explicit GGUF model and skip that download. | Unset |
+| `RUNED_MODEL_VARIANT` | Select a named model from the manifest. | `default_model` |
+| `RUNED_CTX_SIZE` | Maximum input context passed to `llama-server`. | `2048` |
+| `RUNED_IDLE_TIMEOUT` | Suspend the model backend after this idle duration. | `10m` |
 
-`RUNED_MANIFEST` should be **HTTPS** in production. HTTP is permitted
-(for private networks) but emits a warning at startup — a MITM that
-rewrites the manifest can also rewrite the per-artifact SHA256s, so
-artifact integrity collapses to "trust the manifest channel" alone.
+`RUNED_MANIFEST` should use HTTPS in production. Artifact hashes protect downloads only after the manifest itself has been trusted.
 
-The `DefaultManifestURL` referenced in the table above is injected at
-build time via `-ldflags`; see [`CONTRIBUTING.md`](CONTRIBUTING.md#build-time-options)
-for the relevant `make build` flags.
+An optional `~/.runed/config.json` can specify `runed_binary`, `llama_server`, `model`, `model_variant`, and `idle_timeout`. Environment variables remain useful for one-off development overrides.
 
-### Manifest format
+## Release model
 
-`runed` reads only a subset of the manifest; extra keys (used by the
-companion `rune` installer) are ignored:
+The release workflow currently pins **Qwen3-Embedding-0.6B Q8_0**, approximately 610 MB, as the production manifest's default model. The f16 model remains the parity reference; smaller quantizations trade retrieval fidelity for disk and memory savings.
 
-```json
-{
-  "version": 1,
-  "platforms": {
-    "darwin-arm64": {
-      "llama_server": {
-        "url":     "https://.../llama-mac-arm64.tar.gz",
-        "sha256":  "...",
-        "size":    22000000,
-        "extract": "tar.gz",
-        "exec":    "llama-server"
-      }
-    }
-  },
-  "models": {
-    "qwen3-embedding-0.6b.q6_K": {
-      "url":    "https://huggingface.co/.../qwen3-embedding-0.6b-q6_k.gguf",
-      "sha256": "...",
-      "size":   472000000
-    }
-  },
-  "default_model": "qwen3-embedding-0.6b.q6_K"
-}
+| Variant | Approximate size | Mean cosine vs. f16 | Intended use |
+| --- | ---: | ---: | --- |
+| f16 | 1.1 GB | ≈ 0.99999 | Parity reference |
+| **Q8_0** | **610 MB** | **≈ 0.9993** | **Current release default** |
+| Q6_K | 472 MB | 0.994 | Smaller high-quality alternative |
+| Q5_K_M | 424 MB | 0.990 | Size-sensitive environments |
+| Q4_K_M | 378 MB | 0.971 | Development or secondary reranking |
+
+The selected manifest controls the actual filename, hash, and default. Treat this table as guidance, not a substitute for inspecting a custom manifest.
+
+## Development
+
+Go 1.26.2 or newer is required.
+
+```bash
+make build
+make test
+
+# Full integration coverage with local artifacts
+RUNED_TEST_LLAMA_SERVER=/path/to/llama-server \
+RUNED_TEST_GGUF=/path/to/Qwen3-Embedding-0.6B-Q8_0.gguf \
+go test -race ./...
 ```
 
-- `extract`: `""` (raw binary placed at `LlamaDir/<exec>`) or `"tar.gz"`
-  (extracted into `LlamaDir`, `exec` path resolved inside).
-- A sidecar marker `~/.runed/bin/llama-cpp/.llama_server.sha256` tracks
-  the last-installed tarball hash so repeat boots don't re-extract.
-- Models are verified by hashing the on-disk file against
-  `models[<variant>].sha256` — no marker file.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for protobuf generation, build-time manifest injection, and model parity requirements.
 
-### config.json (`~/.runed/config.json`, optional)
+## Repository map
 
-This file is read by **two** components with overlapping schemas; leave
-any field you don't need unset. Unknown fields are ignored.
+| Path | Responsibility |
+| --- | --- |
+| [`cmd/runed/`](cmd/runed/) | Daemon entry point and process lifecycle. |
+| [`client/`](client/) | Auto-spawning Go client. |
+| [`internal/bootstrap/`](internal/bootstrap/) | Manifest, download, verification, extraction, and license installation. |
+| [`internal/backend/`](internal/backend/) | `llama-server` child process and embedding HTTP bridge. |
+| [`internal/ipc/`](internal/ipc/) | Local socket listener and path handling. |
+| [`internal/server/`](internal/server/) | gRPC health, embedding, centroid, and shutdown services. |
+| [`proto/runed/v1/`](proto/runed/v1/) | Public protobuf contract. |
 
-| Field | Reader | Purpose |
-|---|---|---|
-| `version`        | both        | Schema version (currently `1`) |
-| `llama_server`   | spawn       | If set, skip daemon self-bootstrap and use this binary |
-| `model`          | spawn       | If set, skip daemon self-bootstrap and use this GGUF |
-| `runed_binary`   | spawn       | Path to the daemon binary (fallback to PATH / `DefaultRunedBinary`) |
-| `idle_timeout`   | spawn       | Propagated to the spawned daemon as `RUNED_IDLE_TIMEOUT` |
-| `model_variant`  | bootstrap   | Pick a manifest model variant (overrides `manifest.default_model`) |
+## License and third-party software
 
-Example — minimal config telling the spawn layer to use a custom
-`runed_binary` but leaving artifact resolution to self-bootstrap:
+- `runed`: [Apache License 2.0](LICENSE) with [NOTICE](NOTICE).
+- `llama.cpp` / `llama-server`: MIT; see [`THIRD_PARTY_LICENSES/llama.cpp.LICENSE`](THIRD_PARTY_LICENSES/llama.cpp.LICENSE).
+- Qwen3-Embedding-0.6B: Apache License 2.0; see [`THIRD_PARTY_LICENSES/Qwen3-Embedding.Apache-2.0.LICENSE`](THIRD_PARTY_LICENSES/Qwen3-Embedding.Apache-2.0.LICENSE).
 
-```json
-{
-  "version": 1,
-  "runed_binary": "/opt/runed/bin/runed",
-  "idle_timeout": "1m"
-}
-```
+The bootstrap installs the applicable texts under `$RUNED_HOME/licenses/` beside the downloaded third-party artifacts. See [`THIRD_PARTY_LICENSES/README.md`](THIRD_PARTY_LICENSES/README.md) for the attribution index.
 
-## Model variants
-
-The f16 GGUF is the parity reference — cosine similarity ≥ 0.9999 against
-sentence-transformers on all 8 fixture texts. Quantized variants trade parity
-for size/latency.
-
-| Variant | Size | Mean cosine | Verdict |
-|---|---|---|---|
-| f16 | 1.1 GB | ≈ 0.99999 | parity reference |
-| q8_0 | 610 MB | ≈ 0.9993 | high-fidelity alternative |
-| q6_K | 472 MB | 0.994 | **production default** |
-| q5_K_M | 424 MB | 0.990 | borderline; natural-language only |
-| q4_K_M | 378 MB | 0.971 | rerank-only or dev staging; not sole retrieval backbone |
-
-**Production default is q6_K** (`models/qwen3-embedding-0.6b.q6_K.gguf`) —
-23% smaller than q8_0 with mean cosine 0.994 against the f16 reference.
-f16 is reserved for parity verification against sentence-transformers.
-Set the daemon's `RUNED_MODEL` env var to the desired GGUF path.
-
-## License
-
-- `runed` Go code: MIT (LICENSE file forthcoming).
-- Qwen3-Embedding-0.6B: Apache 2.0.
-- llama.cpp: MIT.
-
-Redistribution of the bundled `llama-server` binary and GGUF model files is
-permitted under the respective upstream licenses; CryptoLab makes no
-independent claims on those artifacts.
+<p align="center">
+  Part of <a href="https://rune.team">RUNE</a> · Built by <a href="https://www.cryptolab.co.kr/">CryptoLab</a>
+</p>

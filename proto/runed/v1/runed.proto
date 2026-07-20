@@ -26,24 +26,48 @@ service RunedService {
   // Shutdown requests a graceful drain. The daemon stops accepting new
   // requests, completes in-flight ones, and exits.
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+
+  // SetCentroids replaces the daemon's IVF centroid set (header frame, then
+  // id-ordered batches — the same wire shape runespace's GetCentroids
+  // streams). rune-mcp relays the set here from the Console so Embed can route
+  // inserts (with_route) without runed ever dialing the index engine. The
+  // set is persisted to the daemon cache and survives restarts.
+  rpc SetCentroids(stream SetCentroidsRequest) returns (SetCentroidsResponse);
 }
 
 message EmbedRequest {
   // Input text. Maximum length is InfoResponse.max_text_length characters.
   // Exceeding the limit returns INVALID_ARGUMENT.
   string text = 1;
+
+  // When true the response also carries the vector's IVF cluster assignment
+  // (cluster_id + centroid_set_version). Requires a centroid set loaded via
+  // SetCentroids; otherwise the call fails with FAILED_PRECONDITION.
+  bool with_route = 2;
 }
 
 message EmbedResponse {
   // L2-normalized embedding. The server always normalizes output
   // (llama.cpp default); no opt-out. Length equals InfoResponse.vector_dim.
   repeated float vector = 1 [packed = true];
+
+  // IVF hard single assignment (0..nlist-1). Only set when the request asked
+  // for routing (with_route); the vector is already normalized so the
+  // assignment metric is max inner product, matching runespace insert routing.
+  uint32 cluster_id = 2;
+
+  // Version (content hash) of the centroid set the assignment was routed
+  // against. Callers echo this to the index engine so a stale set is rejected.
+  string centroid_set_version = 3;
 }
 
 message EmbedBatchRequest {
   // Input texts. Batch size must not exceed InfoResponse.max_batch_size.
   // Each text individually bound by InfoResponse.max_text_length.
   repeated string texts = 1;
+
+  // Same as EmbedRequest.with_route, applied to every embedding in the batch.
+  bool with_route = 2;
 }
 
 message EmbedBatchResponse {
@@ -70,6 +94,10 @@ message InfoResponse {
 
   // Maximum batch size accepted by EmbedBatch.
   int32 max_batch_size = 5;
+
+  // Version of the currently loaded IVF centroid set; empty when none is
+  // loaded (with_route requests fail until SetCentroids delivers one).
+  string centroid_set_version = 6;
 }
 
 message HealthRequest {}
@@ -120,4 +148,38 @@ message ShutdownRequest {
 message ShutdownResponse {
   // True if the daemon accepted the shutdown request and is now draining.
   bool accepted = 1;
+}
+
+message SetCentroidsRequest {
+  oneof payload {
+    CentroidSetHeader header = 1;
+    CentroidBatch batch = 2;
+  }
+}
+
+// CentroidSetHeader opens the stream: identity and shape of the set.
+message CentroidSetHeader {
+  string version = 1; // content hash (sha256); must be non-empty
+  uint32 dim = 2;     // must equal InfoResponse.vector_dim
+  uint32 nlist = 3;   // total centroid count that will follow
+  // evi preset the set was trained for (e.g. "IP1") — a version-hash
+  // ingredient. When present, runed recomputes the content hash over the
+  // received vectors and rejects the push on mismatch; empty (legacy
+  // senders) skips that verification.
+  string preset = 4;
+}
+
+// CentroidBatch carries centroids in id order (append order == cluster id).
+message CentroidBatch {
+  repeated Centroid centroids = 1;
+}
+
+message Centroid {
+  uint32 id = 1;
+  repeated float vec = 2 [packed = true];
+}
+
+message SetCentroidsResponse {
+  string version = 1; // version now active
+  uint32 nlist = 2;   // centroids loaded
 }

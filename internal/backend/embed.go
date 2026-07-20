@@ -8,9 +8,23 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 )
 
 const maxErrorBodyBytes = 4 << 10 // 4 KiB cap for reading an error body
+
+// embedRequestTimeout is an absolute ceiling on a single embed HTTP call.
+// http.DefaultClient has no timeout and the caller's ctx may carry none, so
+// without this a llama-server that accepts the TCP connection but never
+// responds (a hang, not a crash — a crash resets the connection) would block
+// the call forever. That call holds inflightMu.RLock, so a forever-blocked
+// embed would also wedge restartIfDead's inflightMu.Lock() — the recovery path
+// that exists precisely to replace a stuck server. The ceiling is far above
+// any legitimate embed, including deep-queue waits observed under heavy
+// concurrency (~10s), so it only ever trips on a genuinely wedged backend;
+// the request then fails, releasing the RLock, and the next EnsureStarted
+// restarts the child. A var (not const) so tests can shrink it.
+var embedRequestTimeout = 120 * time.Second
 
 // ErrNotStarted is returned when Embed/EmbedBatch is invoked but the
 // backend has no live llama-server (port == 0). Callers can recover by
@@ -54,6 +68,13 @@ func (b *LlamaBackend) doJSON(ctx context.Context, path string, in any, out any)
 		return fmt.Errorf("marshal request: %w", err)
 	}
 
+	// Bound the call so a hung (not crashed) llama-server can't block it — and
+	// thus the inflightMu.RLock it holds — forever. WithTimeout fires at the
+	// earlier of the caller's deadline or our ceiling, so a caller with a
+	// tighter deadline still wins.
+	ctx, cancel := context.WithTimeout(ctx, embedRequestTimeout)
+	defer cancel()
+
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -77,6 +98,10 @@ func (b *LlamaBackend) doJSON(ctx context.Context, path string, in any, out any)
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
 		return fmt.Errorf("decode: %w", err)
 	}
+	// A completed request is the strongest proof of life there is — it keeps
+	// EnsureStarted's health verdict from mistaking a saturated child (whose
+	// /health probes starve under inference load) for a dead one.
+	b.noteAlive()
 	return nil
 }
 

@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/CryptoLabInc/runed/internal/ipc"
 )
 
 // dialResult enumerates the meaningful outcomes of probing the daemon
@@ -81,7 +83,15 @@ func EnsureDaemon(ctx context.Context, socketPath string) error {
 // We don't speak gRPC here — successful dial + immediate close is
 // sufficient evidence that a listener exists. The actual Health RPC
 // happens later when the caller's Connect runs.
+//
+// The canonical path is resolved via ipc.ResolveSocketPath before any
+// stat/dial: when $RUNED_HOME is deep, the daemon binds a short
+// deterministic alias, and probing the canonical path would always report
+// the daemon absent. EnsureDaemon deliberately keeps the CANONICAL path for
+// everything else — the spawn.lock location, and the RUNED_HOME the daemon
+// is launched with — so only the socket itself moves to the alias.
 func probeDaemon(ctx context.Context, socketPath string) (dialResult, error) {
+	socketPath = ipc.ResolveSocketPath(socketPath)
 	// Pre-flight stat: if the path exists but isn't a socket, classify as
 	// hostile before attempting the dial. Linux returns ECONNREFUSED for
 	// dialing a regular file (which our errors.Is below would otherwise

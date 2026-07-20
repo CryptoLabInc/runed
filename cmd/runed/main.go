@@ -53,6 +53,7 @@ import (
 	"github.com/CryptoLabInc/runed/internal/backend"
 	"github.com/CryptoLabInc/runed/internal/bootstrap"
 	"github.com/CryptoLabInc/runed/internal/ipc"
+	"github.com/CryptoLabInc/runed/internal/route"
 	"github.com/CryptoLabInc/runed/internal/server"
 	"google.golang.org/grpc"
 )
@@ -91,7 +92,12 @@ func run() error {
 	}
 	logger.Info("paths resolved", "home", paths.Home)
 
-	sockPath := filepath.Join(paths.Home, "embedding.sock")
+	// When $RUNED_HOME is deep, the canonical path can exceed the
+	// platform's sun_path limit (104 bytes on macOS, 108 on Linux) and cannot
+	// be bound or dialed. Resolve it up front so the reachability probe, the
+	// stale-socket cleanup, the ownership watchdog, and the actual bind all
+	// operate on the same (possibly short-aliased) path the client dials.
+	sockPath := ipc.ResolveSocketPath(filepath.Join(paths.Home, "embedding.sock"))
 
 	// Early bail-out: if another daemon is already accepting connections on
 	// our socket, we'd just waste time on self-bootstrap before failing at
@@ -126,6 +132,17 @@ func run() error {
 	// the multi-minute install window. SetBackend below flips Health
 	// to STATUS_OK once llama-server is up.
 	srv := server.New(daemonVersion)
+	srv.SetCentroidCacheDir(paths.Cache)
+	// Restore the IVF centroid set from the disk cache so a restarted daemon
+	// serves with_route immediately; a missing/corrupt cache just means
+	// routing waits for the next SetCentroids push from rune-mcp.
+	if cs, err := route.Load(paths.Cache); err == nil {
+		if err := srv.LoadCentroids(cs); err != nil {
+			logger.Warn("centroid cache rejected", "err", err)
+		} else {
+			logger.Info("centroid cache restored", "version", cs.Version, "nlist", len(cs.Vectors))
+		}
+	}
 	lis, err := ipc.Listen(sockPath)
 	if err != nil {
 		return fmt.Errorf("ipc listen: %w", err)

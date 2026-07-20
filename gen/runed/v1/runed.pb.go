@@ -136,7 +136,11 @@ type EmbedRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Input text. Maximum length is InfoResponse.max_text_length characters.
 	// Exceeding the limit returns INVALID_ARGUMENT.
-	Text          string `protobuf:"bytes,1,opt,name=text,proto3" json:"text,omitempty"`
+	Text string `protobuf:"bytes,1,opt,name=text,proto3" json:"text,omitempty"`
+	// When true the response also carries the vector's IVF cluster assignment
+	// (cluster_id + centroid_set_version). Requires a centroid set loaded via
+	// SetCentroids; otherwise the call fails with FAILED_PRECONDITION.
+	WithRoute     bool `protobuf:"varint,2,opt,name=with_route,json=withRoute,proto3" json:"with_route,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -178,13 +182,27 @@ func (x *EmbedRequest) GetText() string {
 	return ""
 }
 
+func (x *EmbedRequest) GetWithRoute() bool {
+	if x != nil {
+		return x.WithRoute
+	}
+	return false
+}
+
 type EmbedResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// L2-normalized embedding. The server always normalizes output
 	// (llama.cpp default); no opt-out. Length equals InfoResponse.vector_dim.
-	Vector        []float32 `protobuf:"fixed32,1,rep,packed,name=vector,proto3" json:"vector,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Vector []float32 `protobuf:"fixed32,1,rep,packed,name=vector,proto3" json:"vector,omitempty"`
+	// IVF hard single assignment (0..nlist-1). Only set when the request asked
+	// for routing (with_route); the vector is already normalized so the
+	// assignment metric is max inner product, matching runespace insert routing.
+	ClusterId uint32 `protobuf:"varint,2,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	// Version (content hash) of the centroid set the assignment was routed
+	// against. Callers echo this to the index engine so a stale set is rejected.
+	CentroidSetVersion string `protobuf:"bytes,3,opt,name=centroid_set_version,json=centroidSetVersion,proto3" json:"centroid_set_version,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *EmbedResponse) Reset() {
@@ -224,11 +242,27 @@ func (x *EmbedResponse) GetVector() []float32 {
 	return nil
 }
 
+func (x *EmbedResponse) GetClusterId() uint32 {
+	if x != nil {
+		return x.ClusterId
+	}
+	return 0
+}
+
+func (x *EmbedResponse) GetCentroidSetVersion() string {
+	if x != nil {
+		return x.CentroidSetVersion
+	}
+	return ""
+}
+
 type EmbedBatchRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Input texts. Batch size must not exceed InfoResponse.max_batch_size.
 	// Each text individually bound by InfoResponse.max_text_length.
-	Texts         []string `protobuf:"bytes,1,rep,name=texts,proto3" json:"texts,omitempty"`
+	Texts []string `protobuf:"bytes,1,rep,name=texts,proto3" json:"texts,omitempty"`
+	// Same as EmbedRequest.with_route, applied to every embedding in the batch.
+	WithRoute     bool `protobuf:"varint,2,opt,name=with_route,json=withRoute,proto3" json:"with_route,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -268,6 +302,13 @@ func (x *EmbedBatchRequest) GetTexts() []string {
 		return x.Texts
 	}
 	return nil
+}
+
+func (x *EmbedBatchRequest) GetWithRoute() bool {
+	if x != nil {
+		return x.WithRoute
+	}
+	return false
 }
 
 type EmbedBatchResponse struct {
@@ -364,9 +405,12 @@ type InfoResponse struct {
 	// INVALID_ARGUMENT.
 	MaxTextLength int32 `protobuf:"varint,4,opt,name=max_text_length,json=maxTextLength,proto3" json:"max_text_length,omitempty"`
 	// Maximum batch size accepted by EmbedBatch.
-	MaxBatchSize  int32 `protobuf:"varint,5,opt,name=max_batch_size,json=maxBatchSize,proto3" json:"max_batch_size,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	MaxBatchSize int32 `protobuf:"varint,5,opt,name=max_batch_size,json=maxBatchSize,proto3" json:"max_batch_size,omitempty"`
+	// Version of the currently loaded IVF centroid set; empty when none is
+	// loaded (with_route requests fail until SetCentroids delivers one).
+	CentroidSetVersion string `protobuf:"bytes,6,opt,name=centroid_set_version,json=centroidSetVersion,proto3" json:"centroid_set_version,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *InfoResponse) Reset() {
@@ -432,6 +476,13 @@ func (x *InfoResponse) GetMaxBatchSize() int32 {
 		return x.MaxBatchSize
 	}
 	return 0
+}
+
+func (x *InfoResponse) GetCentroidSetVersion() string {
+	if x != nil {
+		return x.CentroidSetVersion
+	}
+	return ""
 }
 
 type HealthRequest struct {
@@ -658,29 +709,341 @@ func (x *ShutdownResponse) GetAccepted() bool {
 	return false
 }
 
+type SetCentroidsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Payload:
+	//
+	//	*SetCentroidsRequest_Header
+	//	*SetCentroidsRequest_Batch
+	Payload       isSetCentroidsRequest_Payload `protobuf_oneof:"payload"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetCentroidsRequest) Reset() {
+	*x = SetCentroidsRequest{}
+	mi := &file_runed_v1_runed_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetCentroidsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetCentroidsRequest) ProtoMessage() {}
+
+func (x *SetCentroidsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_runed_v1_runed_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetCentroidsRequest.ProtoReflect.Descriptor instead.
+func (*SetCentroidsRequest) Descriptor() ([]byte, []int) {
+	return file_runed_v1_runed_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *SetCentroidsRequest) GetPayload() isSetCentroidsRequest_Payload {
+	if x != nil {
+		return x.Payload
+	}
+	return nil
+}
+
+func (x *SetCentroidsRequest) GetHeader() *CentroidSetHeader {
+	if x != nil {
+		if x, ok := x.Payload.(*SetCentroidsRequest_Header); ok {
+			return x.Header
+		}
+	}
+	return nil
+}
+
+func (x *SetCentroidsRequest) GetBatch() *CentroidBatch {
+	if x != nil {
+		if x, ok := x.Payload.(*SetCentroidsRequest_Batch); ok {
+			return x.Batch
+		}
+	}
+	return nil
+}
+
+type isSetCentroidsRequest_Payload interface {
+	isSetCentroidsRequest_Payload()
+}
+
+type SetCentroidsRequest_Header struct {
+	Header *CentroidSetHeader `protobuf:"bytes,1,opt,name=header,proto3,oneof"`
+}
+
+type SetCentroidsRequest_Batch struct {
+	Batch *CentroidBatch `protobuf:"bytes,2,opt,name=batch,proto3,oneof"`
+}
+
+func (*SetCentroidsRequest_Header) isSetCentroidsRequest_Payload() {}
+
+func (*SetCentroidsRequest_Batch) isSetCentroidsRequest_Payload() {}
+
+// CentroidSetHeader opens the stream: identity and shape of the set.
+type CentroidSetHeader struct {
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Version string                 `protobuf:"bytes,1,opt,name=version,proto3" json:"version,omitempty"` // content hash (sha256); must be non-empty
+	Dim     uint32                 `protobuf:"varint,2,opt,name=dim,proto3" json:"dim,omitempty"`        // must equal InfoResponse.vector_dim
+	Nlist   uint32                 `protobuf:"varint,3,opt,name=nlist,proto3" json:"nlist,omitempty"`    // total centroid count that will follow
+	// evi preset the set was trained for (e.g. "IP1") — a version-hash
+	// ingredient. When present, runed recomputes the content hash over the
+	// received vectors and rejects the push on mismatch; empty (legacy
+	// senders) skips that verification.
+	Preset        string `protobuf:"bytes,4,opt,name=preset,proto3" json:"preset,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CentroidSetHeader) Reset() {
+	*x = CentroidSetHeader{}
+	mi := &file_runed_v1_runed_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CentroidSetHeader) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CentroidSetHeader) ProtoMessage() {}
+
+func (x *CentroidSetHeader) ProtoReflect() protoreflect.Message {
+	mi := &file_runed_v1_runed_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CentroidSetHeader.ProtoReflect.Descriptor instead.
+func (*CentroidSetHeader) Descriptor() ([]byte, []int) {
+	return file_runed_v1_runed_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *CentroidSetHeader) GetVersion() string {
+	if x != nil {
+		return x.Version
+	}
+	return ""
+}
+
+func (x *CentroidSetHeader) GetDim() uint32 {
+	if x != nil {
+		return x.Dim
+	}
+	return 0
+}
+
+func (x *CentroidSetHeader) GetNlist() uint32 {
+	if x != nil {
+		return x.Nlist
+	}
+	return 0
+}
+
+func (x *CentroidSetHeader) GetPreset() string {
+	if x != nil {
+		return x.Preset
+	}
+	return ""
+}
+
+// CentroidBatch carries centroids in id order (append order == cluster id).
+type CentroidBatch struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Centroids     []*Centroid            `protobuf:"bytes,1,rep,name=centroids,proto3" json:"centroids,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CentroidBatch) Reset() {
+	*x = CentroidBatch{}
+	mi := &file_runed_v1_runed_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CentroidBatch) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CentroidBatch) ProtoMessage() {}
+
+func (x *CentroidBatch) ProtoReflect() protoreflect.Message {
+	mi := &file_runed_v1_runed_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CentroidBatch.ProtoReflect.Descriptor instead.
+func (*CentroidBatch) Descriptor() ([]byte, []int) {
+	return file_runed_v1_runed_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *CentroidBatch) GetCentroids() []*Centroid {
+	if x != nil {
+		return x.Centroids
+	}
+	return nil
+}
+
+type Centroid struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            uint32                 `protobuf:"varint,1,opt,name=id,proto3" json:"id,omitempty"`
+	Vec           []float32              `protobuf:"fixed32,2,rep,packed,name=vec,proto3" json:"vec,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Centroid) Reset() {
+	*x = Centroid{}
+	mi := &file_runed_v1_runed_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Centroid) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Centroid) ProtoMessage() {}
+
+func (x *Centroid) ProtoReflect() protoreflect.Message {
+	mi := &file_runed_v1_runed_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Centroid.ProtoReflect.Descriptor instead.
+func (*Centroid) Descriptor() ([]byte, []int) {
+	return file_runed_v1_runed_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *Centroid) GetId() uint32 {
+	if x != nil {
+		return x.Id
+	}
+	return 0
+}
+
+func (x *Centroid) GetVec() []float32 {
+	if x != nil {
+		return x.Vec
+	}
+	return nil
+}
+
+type SetCentroidsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Version       string                 `protobuf:"bytes,1,opt,name=version,proto3" json:"version,omitempty"` // version now active
+	Nlist         uint32                 `protobuf:"varint,2,opt,name=nlist,proto3" json:"nlist,omitempty"`    // centroids loaded
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetCentroidsResponse) Reset() {
+	*x = SetCentroidsResponse{}
+	mi := &file_runed_v1_runed_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetCentroidsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetCentroidsResponse) ProtoMessage() {}
+
+func (x *SetCentroidsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_runed_v1_runed_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetCentroidsResponse.ProtoReflect.Descriptor instead.
+func (*SetCentroidsResponse) Descriptor() ([]byte, []int) {
+	return file_runed_v1_runed_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *SetCentroidsResponse) GetVersion() string {
+	if x != nil {
+		return x.Version
+	}
+	return ""
+}
+
+func (x *SetCentroidsResponse) GetNlist() uint32 {
+	if x != nil {
+		return x.Nlist
+	}
+	return 0
+}
+
 var File_runed_v1_runed_proto protoreflect.FileDescriptor
 
 const file_runed_v1_runed_proto_rawDesc = "" +
 	"\n" +
-	"\x14runed/v1/runed.proto\x12\bruned.v1\"\"\n" +
+	"\x14runed/v1/runed.proto\x12\bruned.v1\"A\n" +
 	"\fEmbedRequest\x12\x12\n" +
-	"\x04text\x18\x01 \x01(\tR\x04text\"+\n" +
+	"\x04text\x18\x01 \x01(\tR\x04text\x12\x1d\n" +
+	"\n" +
+	"with_route\x18\x02 \x01(\bR\twithRoute\"|\n" +
 	"\rEmbedResponse\x12\x1a\n" +
-	"\x06vector\x18\x01 \x03(\x02B\x02\x10\x01R\x06vector\")\n" +
+	"\x06vector\x18\x01 \x03(\x02B\x02\x10\x01R\x06vector\x12\x1d\n" +
+	"\n" +
+	"cluster_id\x18\x02 \x01(\rR\tclusterId\x120\n" +
+	"\x14centroid_set_version\x18\x03 \x01(\tR\x12centroidSetVersion\"H\n" +
 	"\x11EmbedBatchRequest\x12\x14\n" +
-	"\x05texts\x18\x01 \x03(\tR\x05texts\"M\n" +
+	"\x05texts\x18\x01 \x03(\tR\x05texts\x12\x1d\n" +
+	"\n" +
+	"with_route\x18\x02 \x01(\bR\twithRoute\"M\n" +
 	"\x12EmbedBatchResponse\x127\n" +
 	"\n" +
 	"embeddings\x18\x01 \x03(\v2\x17.runed.v1.EmbedResponseR\n" +
 	"embeddings\"\r\n" +
-	"\vInfoRequest\"\xc9\x01\n" +
+	"\vInfoRequest\"\xfb\x01\n" +
 	"\fInfoResponse\x12%\n" +
 	"\x0edaemon_version\x18\x01 \x01(\tR\rdaemonVersion\x12%\n" +
 	"\x0emodel_identity\x18\x02 \x01(\tR\rmodelIdentity\x12\x1d\n" +
 	"\n" +
 	"vector_dim\x18\x03 \x01(\x05R\tvectorDim\x12&\n" +
 	"\x0fmax_text_length\x18\x04 \x01(\x05R\rmaxTextLength\x12$\n" +
-	"\x0emax_batch_size\x18\x05 \x01(\x05R\fmaxBatchSize\"\x0f\n" +
+	"\x0emax_batch_size\x18\x05 \x01(\x05R\fmaxBatchSize\x120\n" +
+	"\x14centroid_set_version\x18\x06 \x01(\tR\x12centroidSetVersion\"\x0f\n" +
 	"\rHealthRequest\"\xa9\x04\n" +
 	"\x0eHealthResponse\x127\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x1f.runed.v1.HealthResponse.StatusR\x06status\x12%\n" +
@@ -707,14 +1070,32 @@ const file_runed_v1_runed_proto_rawDesc = "" +
 	"\x0fShutdownRequest\x12#\n" +
 	"\rgrace_seconds\x18\x01 \x01(\x05R\fgraceSeconds\".\n" +
 	"\x10ShutdownResponse\x12\x1a\n" +
-	"\baccepted\x18\x01 \x01(\bR\baccepted2\xc8\x02\n" +
+	"\baccepted\x18\x01 \x01(\bR\baccepted\"\x88\x01\n" +
+	"\x13SetCentroidsRequest\x125\n" +
+	"\x06header\x18\x01 \x01(\v2\x1b.runed.v1.CentroidSetHeaderH\x00R\x06header\x12/\n" +
+	"\x05batch\x18\x02 \x01(\v2\x17.runed.v1.CentroidBatchH\x00R\x05batchB\t\n" +
+	"\apayload\"m\n" +
+	"\x11CentroidSetHeader\x12\x18\n" +
+	"\aversion\x18\x01 \x01(\tR\aversion\x12\x10\n" +
+	"\x03dim\x18\x02 \x01(\rR\x03dim\x12\x14\n" +
+	"\x05nlist\x18\x03 \x01(\rR\x05nlist\x12\x16\n" +
+	"\x06preset\x18\x04 \x01(\tR\x06preset\"A\n" +
+	"\rCentroidBatch\x120\n" +
+	"\tcentroids\x18\x01 \x03(\v2\x12.runed.v1.CentroidR\tcentroids\"0\n" +
+	"\bCentroid\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\rR\x02id\x12\x14\n" +
+	"\x03vec\x18\x02 \x03(\x02B\x02\x10\x01R\x03vec\"F\n" +
+	"\x14SetCentroidsResponse\x12\x18\n" +
+	"\aversion\x18\x01 \x01(\tR\aversion\x12\x14\n" +
+	"\x05nlist\x18\x02 \x01(\rR\x05nlist2\x99\x03\n" +
 	"\fRunedService\x128\n" +
 	"\x05Embed\x12\x16.runed.v1.EmbedRequest\x1a\x17.runed.v1.EmbedResponse\x12G\n" +
 	"\n" +
 	"EmbedBatch\x12\x1b.runed.v1.EmbedBatchRequest\x1a\x1c.runed.v1.EmbedBatchResponse\x125\n" +
 	"\x04Info\x12\x15.runed.v1.InfoRequest\x1a\x16.runed.v1.InfoResponse\x12;\n" +
 	"\x06Health\x12\x17.runed.v1.HealthRequest\x1a\x18.runed.v1.HealthResponse\x12A\n" +
-	"\bShutdown\x12\x19.runed.v1.ShutdownRequest\x1a\x1a.runed.v1.ShutdownResponseB\x8f\x01\n" +
+	"\bShutdown\x12\x19.runed.v1.ShutdownRequest\x1a\x1a.runed.v1.ShutdownResponse\x12O\n" +
+	"\fSetCentroids\x12\x1d.runed.v1.SetCentroidsRequest\x1a\x1e.runed.v1.SetCentroidsResponse(\x01B\x8f\x01\n" +
 	"\fcom.runed.v1B\n" +
 	"RunedProtoP\x01Z2github.com/CryptoLabInc/runed/gen/runed/v1;runedv1\xa2\x02\x03RXX\xaa\x02\bRuned.V1\xca\x02\bRuned\\V1\xe2\x02\x14Runed\\V1\\GPBMetadata\xea\x02\tRuned::V1b\x06proto3"
 
@@ -731,40 +1112,50 @@ func file_runed_v1_runed_proto_rawDescGZIP() []byte {
 }
 
 var file_runed_v1_runed_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_runed_v1_runed_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_runed_v1_runed_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
 var file_runed_v1_runed_proto_goTypes = []any{
-	(HealthResponse_Status)(0), // 0: runed.v1.HealthResponse.Status
-	(HealthResponse_Phase)(0),  // 1: runed.v1.HealthResponse.Phase
-	(*EmbedRequest)(nil),       // 2: runed.v1.EmbedRequest
-	(*EmbedResponse)(nil),      // 3: runed.v1.EmbedResponse
-	(*EmbedBatchRequest)(nil),  // 4: runed.v1.EmbedBatchRequest
-	(*EmbedBatchResponse)(nil), // 5: runed.v1.EmbedBatchResponse
-	(*InfoRequest)(nil),        // 6: runed.v1.InfoRequest
-	(*InfoResponse)(nil),       // 7: runed.v1.InfoResponse
-	(*HealthRequest)(nil),      // 8: runed.v1.HealthRequest
-	(*HealthResponse)(nil),     // 9: runed.v1.HealthResponse
-	(*ShutdownRequest)(nil),    // 10: runed.v1.ShutdownRequest
-	(*ShutdownResponse)(nil),   // 11: runed.v1.ShutdownResponse
+	(HealthResponse_Status)(0),   // 0: runed.v1.HealthResponse.Status
+	(HealthResponse_Phase)(0),    // 1: runed.v1.HealthResponse.Phase
+	(*EmbedRequest)(nil),         // 2: runed.v1.EmbedRequest
+	(*EmbedResponse)(nil),        // 3: runed.v1.EmbedResponse
+	(*EmbedBatchRequest)(nil),    // 4: runed.v1.EmbedBatchRequest
+	(*EmbedBatchResponse)(nil),   // 5: runed.v1.EmbedBatchResponse
+	(*InfoRequest)(nil),          // 6: runed.v1.InfoRequest
+	(*InfoResponse)(nil),         // 7: runed.v1.InfoResponse
+	(*HealthRequest)(nil),        // 8: runed.v1.HealthRequest
+	(*HealthResponse)(nil),       // 9: runed.v1.HealthResponse
+	(*ShutdownRequest)(nil),      // 10: runed.v1.ShutdownRequest
+	(*ShutdownResponse)(nil),     // 11: runed.v1.ShutdownResponse
+	(*SetCentroidsRequest)(nil),  // 12: runed.v1.SetCentroidsRequest
+	(*CentroidSetHeader)(nil),    // 13: runed.v1.CentroidSetHeader
+	(*CentroidBatch)(nil),        // 14: runed.v1.CentroidBatch
+	(*Centroid)(nil),             // 15: runed.v1.Centroid
+	(*SetCentroidsResponse)(nil), // 16: runed.v1.SetCentroidsResponse
 }
 var file_runed_v1_runed_proto_depIdxs = []int32{
 	3,  // 0: runed.v1.EmbedBatchResponse.embeddings:type_name -> runed.v1.EmbedResponse
 	0,  // 1: runed.v1.HealthResponse.status:type_name -> runed.v1.HealthResponse.Status
 	1,  // 2: runed.v1.HealthResponse.phase:type_name -> runed.v1.HealthResponse.Phase
-	2,  // 3: runed.v1.RunedService.Embed:input_type -> runed.v1.EmbedRequest
-	4,  // 4: runed.v1.RunedService.EmbedBatch:input_type -> runed.v1.EmbedBatchRequest
-	6,  // 5: runed.v1.RunedService.Info:input_type -> runed.v1.InfoRequest
-	8,  // 6: runed.v1.RunedService.Health:input_type -> runed.v1.HealthRequest
-	10, // 7: runed.v1.RunedService.Shutdown:input_type -> runed.v1.ShutdownRequest
-	3,  // 8: runed.v1.RunedService.Embed:output_type -> runed.v1.EmbedResponse
-	5,  // 9: runed.v1.RunedService.EmbedBatch:output_type -> runed.v1.EmbedBatchResponse
-	7,  // 10: runed.v1.RunedService.Info:output_type -> runed.v1.InfoResponse
-	9,  // 11: runed.v1.RunedService.Health:output_type -> runed.v1.HealthResponse
-	11, // 12: runed.v1.RunedService.Shutdown:output_type -> runed.v1.ShutdownResponse
-	8,  // [8:13] is the sub-list for method output_type
-	3,  // [3:8] is the sub-list for method input_type
-	3,  // [3:3] is the sub-list for extension type_name
-	3,  // [3:3] is the sub-list for extension extendee
-	0,  // [0:3] is the sub-list for field type_name
+	13, // 3: runed.v1.SetCentroidsRequest.header:type_name -> runed.v1.CentroidSetHeader
+	14, // 4: runed.v1.SetCentroidsRequest.batch:type_name -> runed.v1.CentroidBatch
+	15, // 5: runed.v1.CentroidBatch.centroids:type_name -> runed.v1.Centroid
+	2,  // 6: runed.v1.RunedService.Embed:input_type -> runed.v1.EmbedRequest
+	4,  // 7: runed.v1.RunedService.EmbedBatch:input_type -> runed.v1.EmbedBatchRequest
+	6,  // 8: runed.v1.RunedService.Info:input_type -> runed.v1.InfoRequest
+	8,  // 9: runed.v1.RunedService.Health:input_type -> runed.v1.HealthRequest
+	10, // 10: runed.v1.RunedService.Shutdown:input_type -> runed.v1.ShutdownRequest
+	12, // 11: runed.v1.RunedService.SetCentroids:input_type -> runed.v1.SetCentroidsRequest
+	3,  // 12: runed.v1.RunedService.Embed:output_type -> runed.v1.EmbedResponse
+	5,  // 13: runed.v1.RunedService.EmbedBatch:output_type -> runed.v1.EmbedBatchResponse
+	7,  // 14: runed.v1.RunedService.Info:output_type -> runed.v1.InfoResponse
+	9,  // 15: runed.v1.RunedService.Health:output_type -> runed.v1.HealthResponse
+	11, // 16: runed.v1.RunedService.Shutdown:output_type -> runed.v1.ShutdownResponse
+	16, // 17: runed.v1.RunedService.SetCentroids:output_type -> runed.v1.SetCentroidsResponse
+	12, // [12:18] is the sub-list for method output_type
+	6,  // [6:12] is the sub-list for method input_type
+	6,  // [6:6] is the sub-list for extension type_name
+	6,  // [6:6] is the sub-list for extension extendee
+	0,  // [0:6] is the sub-list for field type_name
 }
 
 func init() { file_runed_v1_runed_proto_init() }
@@ -772,13 +1163,17 @@ func file_runed_v1_runed_proto_init() {
 	if File_runed_v1_runed_proto != nil {
 		return
 	}
+	file_runed_v1_runed_proto_msgTypes[10].OneofWrappers = []any{
+		(*SetCentroidsRequest_Header)(nil),
+		(*SetCentroidsRequest_Batch)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_runed_v1_runed_proto_rawDesc), len(file_runed_v1_runed_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   10,
+			NumMessages:   15,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

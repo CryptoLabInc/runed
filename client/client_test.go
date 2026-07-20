@@ -4,9 +4,22 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	runedv1 "github.com/CryptoLabInc/runed/gen/runed/v1"
+	"github.com/CryptoLabInc/runed/internal/ipc"
+	"google.golang.org/grpc"
 )
+
+type longPathHealthServer struct {
+	runedv1.UnimplementedRunedServiceServer
+}
+
+func (longPathHealthServer) Health(context.Context, *runedv1.HealthRequest) (*runedv1.HealthResponse, error) {
+	return &runedv1.HealthResponse{Status: runedv1.HealthResponse_STATUS_OK}, nil
+}
 
 // shortTempDir returns a per-test temp dir under /tmp. macOS's $TMPDIR and
 // Go's t.TempDir() produce paths that can exceed the 104-byte sockaddr_un
@@ -79,4 +92,30 @@ func TestConnect_WithNoSpawn_FailsFastWhenNoDaemon(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error with WithNoSpawn and no daemon, got nil")
 	}
+}
+
+// TestConnect_LongSocketPath verifies that Listen and Connect independently
+// resolve the same over-limit canonical path and exchange a real Health RPC.
+func TestConnect_LongSocketPath(t *testing.T) {
+	home := filepath.Join(shortTempDir(t), strings.Repeat("d", 60), strings.Repeat("e", 60))
+	canonical := filepath.Join(home, "embedding.sock")
+	lis, err := ipc.Listen(canonical)
+	if err != nil {
+		t.Fatalf("listen long path: %v", err)
+	}
+	gs := grpc.NewServer()
+	runedv1.RegisterRunedServiceServer(gs, longPathHealthServer{})
+	go func() { _ = gs.Serve(lis) }()
+	t.Cleanup(func() {
+		gs.Stop()
+		_ = lis.Close()
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	c, err := Connect(ctx, WithSocketPath(canonical), WithNoSpawn())
+	if err != nil {
+		t.Fatalf("Connect on long canonical path: %v", err)
+	}
+	_ = c.Close()
 }

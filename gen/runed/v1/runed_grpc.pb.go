@@ -19,11 +19,12 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	RunedService_Embed_FullMethodName      = "/runed.v1.RunedService/Embed"
-	RunedService_EmbedBatch_FullMethodName = "/runed.v1.RunedService/EmbedBatch"
-	RunedService_Info_FullMethodName       = "/runed.v1.RunedService/Info"
-	RunedService_Health_FullMethodName     = "/runed.v1.RunedService/Health"
-	RunedService_Shutdown_FullMethodName   = "/runed.v1.RunedService/Shutdown"
+	RunedService_Embed_FullMethodName        = "/runed.v1.RunedService/Embed"
+	RunedService_EmbedBatch_FullMethodName   = "/runed.v1.RunedService/EmbedBatch"
+	RunedService_Info_FullMethodName         = "/runed.v1.RunedService/Info"
+	RunedService_Health_FullMethodName       = "/runed.v1.RunedService/Health"
+	RunedService_Shutdown_FullMethodName     = "/runed.v1.RunedService/Shutdown"
+	RunedService_SetCentroids_FullMethodName = "/runed.v1.RunedService/SetCentroids"
 )
 
 // RunedServiceClient is the client API for RunedService service.
@@ -48,6 +49,12 @@ type RunedServiceClient interface {
 	// Shutdown requests a graceful drain. The daemon stops accepting new
 	// requests, completes in-flight ones, and exits.
 	Shutdown(ctx context.Context, in *ShutdownRequest, opts ...grpc.CallOption) (*ShutdownResponse, error)
+	// SetCentroids replaces the daemon's IVF centroid set (header frame, then
+	// id-ordered batches — the same wire shape runespace's GetCentroids
+	// streams). rune-mcp relays the set here from the Console so Embed can route
+	// inserts (with_route) without runed ever dialing the index engine. The
+	// set is persisted to the daemon cache and survives restarts.
+	SetCentroids(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[SetCentroidsRequest, SetCentroidsResponse], error)
 }
 
 type runedServiceClient struct {
@@ -108,6 +115,19 @@ func (c *runedServiceClient) Shutdown(ctx context.Context, in *ShutdownRequest, 
 	return out, nil
 }
 
+func (c *runedServiceClient) SetCentroids(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[SetCentroidsRequest, SetCentroidsResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &RunedService_ServiceDesc.Streams[0], RunedService_SetCentroids_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[SetCentroidsRequest, SetCentroidsResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type RunedService_SetCentroidsClient = grpc.ClientStreamingClient[SetCentroidsRequest, SetCentroidsResponse]
+
 // RunedServiceServer is the server API for RunedService service.
 // All implementations should embed UnimplementedRunedServiceServer
 // for forward compatibility.
@@ -130,6 +150,12 @@ type RunedServiceServer interface {
 	// Shutdown requests a graceful drain. The daemon stops accepting new
 	// requests, completes in-flight ones, and exits.
 	Shutdown(context.Context, *ShutdownRequest) (*ShutdownResponse, error)
+	// SetCentroids replaces the daemon's IVF centroid set (header frame, then
+	// id-ordered batches — the same wire shape runespace's GetCentroids
+	// streams). rune-mcp relays the set here from the Console so Embed can route
+	// inserts (with_route) without runed ever dialing the index engine. The
+	// set is persisted to the daemon cache and survives restarts.
+	SetCentroids(grpc.ClientStreamingServer[SetCentroidsRequest, SetCentroidsResponse]) error
 }
 
 // UnimplementedRunedServiceServer should be embedded to have
@@ -153,6 +179,9 @@ func (UnimplementedRunedServiceServer) Health(context.Context, *HealthRequest) (
 }
 func (UnimplementedRunedServiceServer) Shutdown(context.Context, *ShutdownRequest) (*ShutdownResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Shutdown not implemented")
+}
+func (UnimplementedRunedServiceServer) SetCentroids(grpc.ClientStreamingServer[SetCentroidsRequest, SetCentroidsResponse]) error {
+	return status.Error(codes.Unimplemented, "method SetCentroids not implemented")
 }
 func (UnimplementedRunedServiceServer) testEmbeddedByValue() {}
 
@@ -264,6 +293,13 @@ func _RunedService_Shutdown_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RunedService_SetCentroids_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(RunedServiceServer).SetCentroids(&grpc.GenericServerStream[SetCentroidsRequest, SetCentroidsResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type RunedService_SetCentroidsServer = grpc.ClientStreamingServer[SetCentroidsRequest, SetCentroidsResponse]
+
 // RunedService_ServiceDesc is the grpc.ServiceDesc for RunedService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -292,6 +328,12 @@ var RunedService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _RunedService_Shutdown_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "SetCentroids",
+			Handler:       _RunedService_SetCentroids_Handler,
+			ClientStreams: true,
+		},
+	},
 	Metadata: "runed/v1/runed.proto",
 }

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/CryptoLabInc/runed/internal/ipc"
 )
 
 // fakeRunedScript is a shell script that mimics what the real runed binary
@@ -49,6 +51,26 @@ func TestEnsureDaemon_AlreadyRunning(t *testing.T) {
 	// it'd fail with "config not found".
 	if err := EnsureDaemon(ctx, sock); err != nil {
 		t.Fatalf("EnsureDaemon: %v", err)
+	}
+}
+
+// A deep RUNED_HOME must still take the already-running fast path: both the
+// listener and spawn probe resolve the same short alias instead of attempting
+// to dial the over-limit canonical path.
+func TestEnsureDaemon_AlreadyRunningAtLongPath(t *testing.T) {
+	home := filepath.Join(shortTempDir(t), strings.Repeat("d", 60), strings.Repeat("e", 60))
+	canonical := filepath.Join(home, "embedding.sock")
+	lis, err := ipc.Listen(canonical)
+	if err != nil {
+		t.Fatalf("listen long path: %v", err)
+	}
+	defer lis.Close()
+
+	t.Setenv("RUNED_CONFIG", "/tmp/runed-no-such-file")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := EnsureDaemon(ctx, canonical); err != nil {
+		t.Fatalf("EnsureDaemon long path: %v", err)
 	}
 }
 

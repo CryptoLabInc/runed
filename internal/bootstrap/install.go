@@ -81,6 +81,12 @@ func EnsureAll(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger, 
 		return "", "", "", fmt.Errorf("install lock: %w", err)
 	}
 	defer lock.Release()
+	// Install the notices before any third-party artifact can be downloaded.
+	// Failing closed keeps every successful artifact installation accompanied
+	// by the license text that permits its redistribution.
+	if err := installLicenses(p); err != nil {
+		return "", "", "", fmt.Errorf("install licenses: %w", err)
+	}
 
 	llamaBinPath, llamaSpec, err := ensureLlamaServer(ctx, p, m, logger, reporter)
 	if err != nil {
@@ -124,6 +130,9 @@ func EnsureLlamaServer(ctx context.Context, p *Paths, m *Manifest, logger *slog.
 		return "", fmt.Errorf("install lock: %w", err)
 	}
 	defer lock.Release()
+	if err := installLicenses(p); err != nil {
+		return "", fmt.Errorf("install licenses: %w", err)
+	}
 
 	llamaBinPath, llamaSpec, err := ensureLlamaServer(ctx, p, m, logger, reporter)
 	if err != nil {
@@ -166,6 +175,9 @@ func EnsureModel(ctx context.Context, p *Paths, m *Manifest, logger *slog.Logger
 		return "", "", fmt.Errorf("install lock: %w", err)
 	}
 	defer lock.Release()
+	if err := installLicenses(p); err != nil {
+		return "", "", fmt.Errorf("install licenses: %w", err)
+	}
 
 	modelPath, modelSpec, err := ensureModel(ctx, p, m, variant, logger, reporter)
 	if err != nil {

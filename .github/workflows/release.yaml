@@ -144,6 +144,23 @@ jobs:
           VERSION: ${{ steps.meta.outputs.version }}
         run: make release-tarball
 
+      - name: Verify license files in release tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)
+          test -n "${archive}"
+          tar -tzf "${archive}" > "${archive}.contents"
+          for path in \
+            LICENSE \
+            NOTICE \
+            THIRD_PARTY_LICENSES/README.md \
+            THIRD_PARTY_LICENSES/llama.cpp.LICENSE \
+            THIRD_PARTY_LICENSES/Qwen3-Embedding.Apache-2.0.LICENSE
+          do
+            grep -Fxq "${path}" "${archive}.contents"
+          done
+
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.goos }}-${{ matrix.goarch }}

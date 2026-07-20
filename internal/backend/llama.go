@@ -15,8 +15,26 @@ import (
 	"regexp"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
+)
+
+// Health-verdict tuning. A saturated single-slot llama-server can miss the
+// quick per-RPC probe (its HTTP loop is starved by inference) while being
+// perfectly alive — killing it then severs every queued embed and the
+// restarted server saturates again immediately, a restart loop observed in
+// production (dozens of kills over 3 minutes, 244 embeds cut with EOF).
+const (
+	// quickProbeTimeout is the cheap per-RPC /health probe. Misses under
+	// saturation are expected and are NOT treated as death on their own.
+	quickProbeTimeout = 500 * time.Millisecond
+	// verdictProbeTimeout is the generous probe used when actually deciding
+	// whether to restart.
+	verdictProbeTimeout = 2 * time.Second
+	// aliveGrace: if any embed completed or probe succeeded this recently,
+	// the child is alive by definition — a failed quick probe means busy.
+	aliveGrace = 15 * time.Second
 )
 
 type Config struct {
@@ -80,6 +98,26 @@ type LlamaBackend struct {
 	// short-lived RPC context, so the resurrected llama-server outlives
 	// the request that woke it.
 	daemonCtx context.Context
+
+	// restartMu single-flights the drain-and-verdict restart path so a burst
+	// of RPCs that all missed the quick probe elects one leader; followers
+	// find the child verified (or restarted) and return. Lock order:
+	// restartMu → inflightMu → lifecycleMu.
+	restartMu sync.Mutex
+	// lastAlive is the unix-nano time of the last proof of life: a successful
+	// /health probe or a completed embed HTTP call. It distinguishes a busy
+	// child (making progress, probes starved) from a dead one.
+	lastAlive atomic.Int64
+}
+
+// noteAlive records a proof of life. Called on successful health probes and
+// completed embed calls (see embed.go).
+func (b *LlamaBackend) noteAlive() { b.lastAlive.Store(time.Now().UnixNano()) }
+
+// recentlyAlive reports whether a proof of life landed within grace.
+func (b *LlamaBackend) recentlyAlive(grace time.Duration) bool {
+	ns := b.lastAlive.Load()
+	return ns != 0 && time.Since(time.Unix(0, ns)) < grace
 }
 
 func NewLlamaBackend(cfg Config) *LlamaBackend {
@@ -129,32 +167,105 @@ func (b *LlamaBackend) Start(ctx context.Context) error {
 // entry: a healthy backend returns within milliseconds (just a quick
 // /health probe under lifecycleMu).
 //
+// A failed quick probe on a running child is NOT treated as death: a
+// saturated llama-server starves its HTTP loop and misses the probe while
+// still making progress. If a proof of life (completed embed or successful
+// probe) landed within aliveGrace the child is considered busy and left
+// alone; only a child with no life signs goes to restartIfDead, which drains
+// in-flight work and re-probes before killing anything.
+//
 // Pre-condition: Start has been called at least once so daemonCtx is
 // recorded. Returns an error if the daemonCtx has been cancelled
 // (process shutdown in progress).
 func (b *LlamaBackend) EnsureStarted() error {
 	b.lifecycleMu.Lock()
-	defer b.lifecycleMu.Unlock()
 	if b.daemonCtx == nil {
+		b.lifecycleMu.Unlock()
 		return errors.New("backend not initialized; Start must be called once first")
 	}
-	if err := b.daemonCtx.Err(); err != nil {
+	dctx := b.daemonCtx
+	if err := dctx.Err(); err != nil {
+		b.lifecycleMu.Unlock()
 		return fmt.Errorf("backend daemon context done: %w", err)
 	}
 
 	b.mu.Lock()
 	haveCmd := b.cmd != nil
 	b.mu.Unlock()
-	if haveCmd {
-		if b.IsHealthy(b.daemonCtx) {
-			return nil
+
+	if !haveCmd { // intentional idle-suspend (or a crash) — plain cold start
+		slog.Info("backend: cold start (resuming after suspend)")
+		start := time.Now()
+		err := b.startLocked(dctx)
+		if err == nil {
+			slog.Info("backend: cold start complete",
+				"port", b.Port(),
+				"duration_ms", time.Since(start).Milliseconds())
 		}
-		slog.Warn("backend: process alive but unhealthy, restarting")
+		b.lifecycleMu.Unlock()
+		return err
+	}
+
+	if b.probeHealthy(dctx, quickProbeTimeout) {
+		b.lifecycleMu.Unlock()
+		return nil
+	}
+	if b.recentlyAlive(aliveGrace) {
+		// Probe starved but work is completing — saturated, not dead.
+		b.lifecycleMu.Unlock()
+		return nil
+	}
+	b.lifecycleMu.Unlock()
+	// No proof of life within grace: escalate — but restartIfDead still
+	// drains and re-probes before it kills anything.
+	return b.restartIfDead(dctx)
+}
+
+// restartIfDead is the only path that may kill an unresponsive child. It
+// tells busy apart from dead by construction:
+//
+//  1. restartMu single-flights bursts of suspicious RPCs;
+//  2. a generous re-probe catches a child a predecessor already fixed;
+//  3. the inflightMu writer lock DRAINS every in-flight embed — a saturated
+//     child empties its queue right here (and nothing gets severed with EOF,
+//     which the old path did by skipping this lock);
+//  4. a post-drain re-probe: a child that answers now was busy — restart is
+//     skipped. Only a child that stays unresponsive with zero load is dead.
+func (b *LlamaBackend) restartIfDead(dctx context.Context) error {
+	b.restartMu.Lock()
+	defer b.restartMu.Unlock()
+
+	// Followers queued behind a leader re-check the cheap signals first: the
+	// leader's drain let embeds complete (stamping lastAlive) and a restart's
+	// startup health poll stamps it too — without this, every queued follower
+	// would run its own drain cycle in series.
+	if b.recentlyAlive(aliveGrace) {
+		return nil
+	}
+	if b.probeHealthy(dctx, verdictProbeTimeout) {
+		return nil // recovered (or a predecessor restarted it)
+	}
+
+	b.inflightMu.Lock()
+	defer b.inflightMu.Unlock()
+	b.lifecycleMu.Lock()
+	defer b.lifecycleMu.Unlock()
+
+	b.mu.Lock()
+	haveCmd := b.cmd != nil
+	b.mu.Unlock()
+	if haveCmd && b.probeHealthy(dctx, verdictProbeTimeout) {
+		slog.Info("backend: health recovered after draining in-flight work — busy, not dead; restart skipped")
+		return nil
+	}
+
+	if haveCmd {
+		slog.Warn("backend: unresponsive with no in-flight work, restarting")
 		_ = b.stopLocked(context.Background())
 	}
-	slog.Info("backend: cold start (resuming after suspend)")
+	slog.Info("backend: cold start (restart after failed health verdict)")
 	start := time.Now()
-	if err := b.startLocked(b.daemonCtx); err != nil {
+	if err := b.startLocked(dctx); err != nil {
 		return err
 	}
 	slog.Info("backend: cold start complete",
@@ -334,12 +445,35 @@ func (b *LlamaBackend) getCmd() *exec.Cmd {
 	return b.cmd
 }
 
+// IsHealthy probes /health and stamps proof of life on success. noteAlive is
+// here, not in probeHealthy, so restart-decision probes (EnsureStarted quick,
+// restartIfDead verdict) don't reset the liveness clock as a side effect.
+//
+// Trade-off (TestQuickProbeStampEdge): without the quick-probe stamp, a rare
+// edge (idle → slow first embed → concurrent second request with a starved
+// quick probe) makes that one request pay the verdict probe (~1.7s vs ~0.5s).
+// No false restart, no drain block, self-corrects on the next embed. If it ever
+// matters, stamp in restartIfDead's verdict probe rather than undo the split.
 func (b *LlamaBackend) IsHealthy(ctx context.Context) bool {
+	ok := b.probeHealthy(ctx, quickProbeTimeout)
+	if ok {
+		b.noteAlive()
+	}
+	return ok
+}
+
+// probeHealthy GETs /health with the given budget and reports whether the
+// server answered 200. It does NOT record proof of life — callers that treat a
+// success as liveness (IsHealthy) stamp it themselves; the direct callers
+// (EnsureStarted's quick probe, restartIfDead's verdict probe) intentionally
+// do not, so a probe made only to decide whether to restart doesn't also reset
+// the idle/liveness clock.
+func (b *LlamaBackend) probeHealthy(ctx context.Context, timeout time.Duration) bool {
 	port := b.Port()
 	if port == 0 {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	url := fmt.Sprintf("http://%s:%d/health", b.cfg.Host, port)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -365,6 +499,12 @@ func (b *LlamaBackend) Serving(ctx context.Context) ServingState {
 	b.mu.Unlock()
 	if haveCmd {
 		if b.IsHealthy(ctx) {
+			return ServingOK
+		}
+		if b.recentlyAlive(aliveGrace) {
+			// Probe starved by a saturated child that is still completing
+			// work — it IS serving, just busy. Reporting DEGRADED here made
+			// dashboards cry wolf during every heavy embed burst.
 			return ServingOK
 		}
 		return ServingDegraded
